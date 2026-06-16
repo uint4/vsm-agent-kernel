@@ -1,13 +1,19 @@
-use crate::{EventFilter, Ledger, LedgerError, LedgerEvent, TraceWindow};
+use crate::{
+    EventFilter, GenomeSnapshot, Ledger, LedgerError, LedgerEvent, StoredTrialRecord, TraceWindow,
+};
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use vsm_core::{TaskTrace, TraceId};
+use vsm_core::{GenomeId, NodeId, SuggestionId, TaskTrace, TraceId};
 
 #[derive(Clone, Default)]
 pub struct InMemoryLedger {
     events: Arc<Mutex<Vec<LedgerEvent>>>,
     traces: Arc<Mutex<Vec<TaskTrace>>>,
+    genomes: Arc<Mutex<BTreeMap<GenomeId, GenomeSnapshot>>>,
+    champion_genomes: Arc<Mutex<BTreeMap<NodeId, GenomeId>>>,
+    trials: Arc<Mutex<BTreeMap<SuggestionId, StoredTrialRecord>>>,
 }
 
 impl InMemoryLedger {
@@ -76,6 +82,76 @@ impl Ledger for InMemoryLedger {
             traces = traces.split_off(start);
         }
         Ok(traces)
+    }
+
+    async fn save_genome_snapshot(&self, snapshot: GenomeSnapshot) -> Result<(), LedgerError> {
+        self.genomes
+            .lock()
+            .await
+            .insert(snapshot.genome_id.clone(), snapshot);
+        Ok(())
+    }
+
+    async fn get_genome_snapshot(
+        &self,
+        genome_id: &GenomeId,
+    ) -> Result<Option<GenomeSnapshot>, LedgerError> {
+        Ok(self.genomes.lock().await.get(genome_id).cloned())
+    }
+
+    async fn set_champion_genome_id(
+        &self,
+        controller_node_id: &NodeId,
+        genome_id: &GenomeId,
+    ) -> Result<(), LedgerError> {
+        self.champion_genomes
+            .lock()
+            .await
+            .insert(controller_node_id.clone(), genome_id.clone());
+        Ok(())
+    }
+
+    async fn get_champion_genome_id(
+        &self,
+        controller_node_id: &NodeId,
+    ) -> Result<Option<GenomeId>, LedgerError> {
+        Ok(self
+            .champion_genomes
+            .lock()
+            .await
+            .get(controller_node_id)
+            .cloned())
+    }
+
+    async fn write_trial_record(&self, record: StoredTrialRecord) -> Result<(), LedgerError> {
+        self.trials
+            .lock()
+            .await
+            .insert(record.trial_id.clone(), record);
+        Ok(())
+    }
+
+    async fn get_trial_record(
+        &self,
+        trial_id: &SuggestionId,
+    ) -> Result<Option<StoredTrialRecord>, LedgerError> {
+        Ok(self.trials.lock().await.get(trial_id).cloned())
+    }
+
+    async fn get_active_trial_record(
+        &self,
+        controller_node_id: &NodeId,
+    ) -> Result<Option<StoredTrialRecord>, LedgerError> {
+        Ok(self
+            .trials
+            .lock()
+            .await
+            .values()
+            .find(|record| {
+                &record.controller_node_id == controller_node_id
+                    && record.status == crate::StoredTrialStatus::Active
+            })
+            .cloned())
     }
 }
 

@@ -160,13 +160,16 @@ The ledger stores:
 - audit start/completion
 - gene suggestions
 - genome patch events
+- genome snapshots
+- per-controller champion genome pointers
+- active and archived trial records
 
 Implementations:
 
 - `InMemoryLedger`
 - `SqliteLedger`
 
-The default subtree trace query uses `assigned_node_id` plus `responsible_ancestor_ids`, which is the minimum viable attribution model for early selection.
+The default subtree trace query uses `assigned_node_id` plus `responsible_ancestor_ids`, which is the minimum viable attribution model for early selection. SQLite and in-memory ledgers also persist enough genome/trial state for controller restart recovery.
 
 ## Controller
 
@@ -231,14 +234,14 @@ System 3* audit
   -> promote, continue, or prune
 ```
 
-Candidate leaves are executable only when a worker harness is manually registered for the candidate node. The controller logs trial lifecycle events through the ledger and promotes by replacing the shared champion genome with the candidate genome.
+Candidate leaves are executable only when a worker harness is manually registered for the candidate node. The controller logs trial lifecycle events through the ledger, persists active trial state, and promotes by replacing the shared champion genome with the candidate genome. The promoted champion and active trial records can be loaded back from `vsm-ledger`.
 
 ## Current Status
 
 | # | Item | Status |
 |---:|---|---|
 | 1 | Leaf worker harness | Implemented |
-| 2 | Ledger | Implemented |
+| 2 | Ledger | Implemented, including genome snapshots and trial state |
 | 3 | Parent controller | Implemented, basic version |
 | 4 | Subtree attribution | Partially implemented |
 | 5 | Simple fitness scoring | Partially implemented |
@@ -246,7 +249,7 @@ Candidate leaves are executable only when a worker harness is manually registere
 | 7 | Bounded mutation experiments | Implemented for one active controller-managed trial |
 | 8 | Promotion/pruning loop | Implemented for one active trial; full GA population loop is future work |
 
-The next milestone is a persistent multi-candidate/champion archive and richer routing/exposure policy. Do not jump to a broad GA population until attribution and rollback remain reliable under multiple overlapping candidates.
+The next milestone is a multi-candidate archive and richer routing/exposure policy. Do not jump to a broad GA population until attribution and rollback remain reliable under multiple overlapping candidates.
 
 ## Validation
 

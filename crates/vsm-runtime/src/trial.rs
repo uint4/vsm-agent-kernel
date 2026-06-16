@@ -65,6 +65,20 @@ impl MutationTrial {
         })
     }
 
+    pub fn restore(
+        suggestion: GeneSuggestion,
+        base_genome_id: GenomeId,
+        candidate_genome: OrganizationalGenome,
+        traces: Vec<TaskTrace>,
+    ) -> Self {
+        Self {
+            suggestion,
+            base_genome_id,
+            candidate_genome,
+            traces,
+        }
+    }
+
     pub fn record_trace(&mut self, trace: TaskTrace) {
         self.traces.push(trace);
     }

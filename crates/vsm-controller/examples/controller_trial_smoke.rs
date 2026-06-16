@@ -64,12 +64,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let suggestion_id = suggestion.id.clone();
 
     let candidate_genome_id = controller.start_trial_from_suggestion(suggestion).await?;
-    controller.register_trial_worker(reviewer_id.clone()).await;
+    controller
+        .register_trial_worker(reviewer_id.clone())
+        .await?;
 
     let candidate_genome = controller
         .active_candidate_genome()
         .await
         .ok_or("candidate genome missing")?;
+
+    let active_recovery_genome = Arc::new(RwLock::new(OrganizationalGenome::new(
+        ViableNode::new_metasystem("active-recovery-placeholder"),
+    )));
+    let active_recovery_controller = ControllerRuntime::new(
+        root_id.clone(),
+        active_recovery_genome,
+        transport.clone(),
+        ledger.clone(),
+    );
+    let restored_candidate = active_recovery_controller
+        .restore_active_trial_from_ledger()
+        .await?;
+    assert_eq!(restored_candidate, Some(candidate_genome_id.clone()));
+
     let candidate_genome = Arc::new(RwLock::new(candidate_genome));
 
     let worker = WorkerHarness::new(
@@ -100,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .metadata
         .insert("trial_approved".to_string(), suggestion_id.to_string());
 
-    let envelope = envelope_for_directive(&directive)?.with_route(None, Some(root_id));
+    let envelope = envelope_for_directive(&directive)?.with_route(None, Some(root_id.clone()));
     transport.publish(envelope).await?;
 
     let results = tokio::time::timeout(Duration::from_secs(5), controller_task).await???;
@@ -114,6 +131,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(promoted.id, candidate_genome_id);
     assert!(promoted.nodes.contains_key(&reviewer_id));
     drop(promoted);
+
+    let recovery_genome = Arc::new(RwLock::new(OrganizationalGenome::new(
+        ViableNode::new_metasystem("recovery-placeholder"),
+    )));
+    let recovery_controller = ControllerRuntime::new(
+        root_id,
+        recovery_genome.clone(),
+        transport.clone(),
+        ledger.clone(),
+    );
+    let recovered = recovery_controller.load_persisted_champion().await?;
+    assert_eq!(recovered, Some(candidate_genome_id.clone()));
+    assert_eq!(recovery_genome.read().await.id, candidate_genome_id);
 
     let traces = ledger.recent_task_traces(TraceWindow::default()).await?;
     println!("ledger trace count: {}", traces.len());

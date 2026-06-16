@@ -10,7 +10,10 @@ use vsm_core::{
     GeneSuggestion, MessageEnvelope, NodeId, OrganizationalGenome, Subscription, TaskPacket,
     TaskResult, TaskTrace, Transport, VsmChannelType,
 };
-use vsm_ledger::{EventFilter, Ledger, LedgerEvent, LedgerEventKind, TraceWindow};
+use vsm_ledger::{
+    EventFilter, GenomeSnapshot, GenomeSnapshotRole, Ledger, LedgerEvent, LedgerEventKind,
+    TraceWindow,
+};
 use vsm_runtime::{TrialConfig, TrialDecision, TrialEvaluation};
 
 pub type SharedGenome = Arc<RwLock<OrganizationalGenome>>;
@@ -101,8 +104,27 @@ impl ControllerRuntime {
         let champion = { self.genome.read().await.clone() };
         let started = {
             let mut trials = self.trials.write().await;
-            trials.start_trial(&champion, suggestion.clone())?
+            trials.start_trial(self.node_id.clone(), &champion, suggestion.clone())?
         };
+        let candidate_genome = self
+            .trials
+            .read()
+            .await
+            .active_candidate_genome()
+            .ok_or(ControllerError::NoActiveTrial)?;
+
+        self.ledger
+            .set_champion_genome(&self.node_id, champion.clone())
+            .await?;
+        self.ledger
+            .save_genome_snapshot(GenomeSnapshot::new(
+                candidate_genome,
+                GenomeSnapshotRole::Candidate,
+            ))
+            .await?;
+        self.ledger
+            .write_trial_record(started.record.clone())
+            .await?;
 
         self.ledger
             .append_event(
@@ -124,12 +146,68 @@ impl ControllerRuntime {
         Ok(started.candidate_genome_id)
     }
 
-    pub async fn register_trial_worker(&self, node_id: NodeId) {
-        self.trials.write().await.register_candidate_worker(node_id);
+    pub async fn register_trial_worker(&self, node_id: NodeId) -> Result<(), ControllerError> {
+        let record = {
+            let mut trials = self.trials.write().await;
+            trials.register_candidate_worker(node_id);
+            trials.active_record(self.node_id.clone())
+        };
+        if let Some(record) = record {
+            self.ledger.write_trial_record(record).await?;
+        }
+        Ok(())
     }
 
     pub async fn active_candidate_genome(&self) -> Option<OrganizationalGenome> {
         self.trials.read().await.active_candidate_genome()
+    }
+
+    pub async fn load_persisted_champion(
+        &self,
+    ) -> Result<Option<vsm_core::GenomeId>, ControllerError> {
+        let Some(champion) = self.ledger.get_champion_genome(&self.node_id).await? else {
+            return Ok(None);
+        };
+        let genome_id = champion.id.clone();
+        *self.genome.write().await = champion;
+        Ok(Some(genome_id))
+    }
+
+    pub async fn restore_active_trial_from_ledger(
+        &self,
+    ) -> Result<Option<vsm_core::GenomeId>, ControllerError> {
+        let Some(record) = self.ledger.get_active_trial_record(&self.node_id).await? else {
+            return Ok(None);
+        };
+        let Some(candidate_snapshot) = self
+            .ledger
+            .get_genome_snapshot(&record.candidate_genome_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let traces = self
+            .ledger
+            .recent_task_traces(TraceWindow {
+                since: Some(record.started_at),
+                limit: Some(500),
+            })
+            .await?
+            .into_iter()
+            .filter(|trace| {
+                trace
+                    .related_suggestion_ids
+                    .iter()
+                    .any(|suggestion_id| suggestion_id == &record.trial_id)
+            })
+            .collect();
+        let candidate_genome_id = candidate_snapshot.genome.id.clone();
+        self.trials.write().await.restore_active_trial(
+            record,
+            candidate_snapshot.genome,
+            traces,
+        )?;
+        Ok(Some(candidate_genome_id))
     }
 
     pub async fn evaluate_active_trial(&self) -> Result<TrialEvaluation, ControllerError> {
@@ -466,6 +544,9 @@ impl ControllerRuntime {
                     .await?;
             }
             self.trials.write().await.mark_task_routed();
+            if let Some(record) = self.trials.read().await.active_record(self.node_id.clone()) {
+                self.ledger.write_trial_record(record).await?;
+            }
         }
 
         let mut envelope = envelope_for_task(&task)?
@@ -534,6 +615,9 @@ impl ControllerRuntime {
         };
 
         if let Some(evaluation) = evaluation {
+            if let Some(record) = self.trials.read().await.active_record(self.node_id.clone()) {
+                self.ledger.write_trial_record(record).await?;
+            }
             self.ledger
                 .append_event(
                     LedgerEvent::new(
@@ -613,11 +697,22 @@ impl ControllerRuntime {
         match evaluation.decision {
             TrialDecision::Continue => Ok(()),
             TrialDecision::Promote => {
-                let completed = { self.trials.write().await.promote_active()? };
+                let completed = {
+                    self.trials
+                        .write()
+                        .await
+                        .promote_active(self.node_id.clone())?
+                };
                 {
                     let mut genome = self.genome.write().await;
                     *genome = completed.candidate_genome.clone();
                 }
+                self.ledger
+                    .set_champion_genome(&self.node_id, completed.candidate_genome.clone())
+                    .await?;
+                self.ledger
+                    .write_trial_record(completed.record.clone())
+                    .await?;
                 self.ledger
                     .append_event(
                         LedgerEvent::new(
@@ -652,7 +747,15 @@ impl ControllerRuntime {
                 Ok(())
             }
             TrialDecision::Prune => {
-                let completed = { self.trials.write().await.prune_active()? };
+                let completed = {
+                    self.trials
+                        .write()
+                        .await
+                        .prune_active(self.node_id.clone())?
+                };
+                self.ledger
+                    .write_trial_record(completed.record.clone())
+                    .await?;
                 self.ledger
                     .append_event(
                         LedgerEvent::new(

@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::{DateTime, Utc};
 use vsm_core::{
     FitnessWeights, GeneSuggestion, GenomeId, NodeId, OrganizationalGenome, TaskPacket, TaskTrace,
 };
+use vsm_ledger::{StoredTrialDecision, StoredTrialRecord, StoredTrialStatus};
 use vsm_runtime::{MutationTrial, TrialConfig, TrialDecision, TrialEvaluation};
 
 use crate::ControllerError;
@@ -25,6 +27,7 @@ pub struct StartedTrial {
     pub suggestion_id: vsm_core::SuggestionId,
     pub base_genome_id: GenomeId,
     pub candidate_genome_id: GenomeId,
+    pub record: StoredTrialRecord,
 }
 
 #[derive(Clone, Debug)]
@@ -34,6 +37,7 @@ pub struct CompletedTrial {
     pub candidate_genome_id: GenomeId,
     pub candidate_genome: OrganizationalGenome,
     pub evaluation: TrialEvaluation,
+    pub record: StoredTrialRecord,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +49,7 @@ pub struct TrialManager {
     registered_candidate_workers: BTreeSet<NodeId>,
     routed_tasks: u64,
     consumed_tokens: u64,
+    active_started_at: Option<DateTime<Utc>>,
 }
 
 impl Default for TrialManager {
@@ -57,6 +62,7 @@ impl Default for TrialManager {
             registered_candidate_workers: BTreeSet::new(),
             routed_tasks: 0,
             consumed_tokens: 0,
+            active_started_at: None,
         }
     }
 }
@@ -72,6 +78,7 @@ impl TrialManager {
 
     pub fn start_trial(
         &mut self,
+        controller_node_id: NodeId,
         champion: &OrganizationalGenome,
         suggestion: GeneSuggestion,
     ) -> Result<StartedTrial, ControllerError> {
@@ -82,16 +89,56 @@ impl TrialManager {
         }
 
         let trial = MutationTrial::from_suggestion(champion, suggestion)?;
+        let record =
+            self.record_for_trial(&trial, controller_node_id, StoredTrialStatus::Active, None);
         let started = StartedTrial {
             suggestion_id: trial.suggestion.id.clone(),
             base_genome_id: trial.base_genome_id.clone(),
             candidate_genome_id: trial.candidate_genome.id.clone(),
+            record,
         };
 
         self.routed_tasks = 0;
         self.consumed_tokens = 0;
+        self.active_started_at = Some(Utc::now());
         self.active = Some(trial);
 
+        Ok(started)
+    }
+
+    pub fn restore_active_trial(
+        &mut self,
+        record: StoredTrialRecord,
+        candidate_genome: OrganizationalGenome,
+        traces: Vec<TaskTrace>,
+    ) -> Result<StartedTrial, ControllerError> {
+        if let Some(active) = &self.active {
+            return Err(ControllerError::TrialAlreadyActive(
+                active.suggestion.id.clone(),
+            ));
+        }
+
+        let trial = MutationTrial::restore(
+            record.suggestion.clone(),
+            record.base_genome_id.clone(),
+            candidate_genome,
+            traces,
+        );
+        let started = StartedTrial {
+            suggestion_id: record.trial_id.clone(),
+            base_genome_id: record.base_genome_id.clone(),
+            candidate_genome_id: record.candidate_genome_id.clone(),
+            record: record.clone(),
+        };
+        self.routed_tasks = record.routed_tasks;
+        self.consumed_tokens = record.consumed_tokens;
+        self.active_started_at = Some(record.started_at);
+        self.registered_candidate_workers = record
+            .registered_candidate_workers
+            .iter()
+            .cloned()
+            .collect();
+        self.active = Some(trial);
         Ok(started)
     }
 
@@ -173,6 +220,11 @@ impl TrialManager {
         Some(trial.evaluate(&self.config, &self.weights))
     }
 
+    pub fn active_record(&self, controller_node_id: NodeId) -> Option<StoredTrialRecord> {
+        let trial = self.active.as_ref()?;
+        Some(self.record_for_trial(trial, controller_node_id, StoredTrialStatus::Active, None))
+    }
+
     pub fn evaluate(&self) -> Result<TrialEvaluation, ControllerError> {
         let Some(trial) = self.active.as_ref() else {
             return Err(ControllerError::NoActiveTrial);
@@ -180,20 +232,40 @@ impl TrialManager {
         Ok(trial.evaluate(&self.config, &self.weights))
     }
 
-    pub fn promote_active(&mut self) -> Result<CompletedTrial, ControllerError> {
+    pub fn promote_active(
+        &mut self,
+        controller_node_id: NodeId,
+    ) -> Result<CompletedTrial, ControllerError> {
         let Some(trial) = self.active.take() else {
             return Err(ControllerError::NoActiveTrial);
         };
-        let completed = completed_trial(&trial, trial.evaluate(&self.config, &self.weights));
+        let evaluation = trial.evaluate(&self.config, &self.weights);
+        let record = self.record_for_trial(
+            &trial,
+            controller_node_id,
+            StoredTrialStatus::Promoted,
+            Some(StoredTrialDecision::Promote),
+        );
+        let completed = completed_trial(&trial, evaluation, record);
         self.archive(trial);
         Ok(completed)
     }
 
-    pub fn prune_active(&mut self) -> Result<CompletedTrial, ControllerError> {
+    pub fn prune_active(
+        &mut self,
+        controller_node_id: NodeId,
+    ) -> Result<CompletedTrial, ControllerError> {
         let Some(trial) = self.active.take() else {
             return Err(ControllerError::NoActiveTrial);
         };
-        let completed = completed_trial(&trial, trial.evaluate(&self.config, &self.weights));
+        let evaluation = trial.evaluate(&self.config, &self.weights);
+        let record = self.record_for_trial(
+            &trial,
+            controller_node_id,
+            StoredTrialStatus::Pruned,
+            Some(StoredTrialDecision::Prune),
+        );
+        let completed = completed_trial(&trial, evaluation, record);
         self.archive(trial);
         Ok(completed)
     }
@@ -204,6 +276,7 @@ impl TrialManager {
         self.routed_tasks = 0;
         self.consumed_tokens = 0;
         self.registered_candidate_workers.clear();
+        self.active_started_at = None;
     }
 
     fn task_passes_safety_limits(&self, task: &TaskPacket, trial: &MutationTrial) -> bool {
@@ -258,6 +331,38 @@ impl TrialManager {
 
         true
     }
+
+    fn record_for_trial(
+        &self,
+        trial: &MutationTrial,
+        controller_node_id: NodeId,
+        status: StoredTrialStatus,
+        decision: Option<StoredTrialDecision>,
+    ) -> StoredTrialRecord {
+        let evaluation = trial.evaluate(&self.config, &self.weights);
+        let mut record = StoredTrialRecord::active(
+            controller_node_id,
+            trial.base_genome_id.clone(),
+            trial.candidate_genome.id.clone(),
+            trial.suggestion.clone(),
+        );
+        if let Some(started_at) = self.active_started_at {
+            record.started_at = started_at;
+        }
+        record.status = status;
+        record.routed_tasks = self.routed_tasks;
+        record.consumed_tokens = self.consumed_tokens;
+        record.trace_count = evaluation.trace_count as u64;
+        record.total_score = evaluation.total_score;
+        record.decision = decision;
+        record.registered_candidate_workers =
+            self.registered_candidate_workers.iter().cloned().collect();
+        record.updated_at = chrono::Utc::now();
+        if record.status != StoredTrialStatus::Active {
+            record.completed_at = Some(record.updated_at);
+        }
+        record
+    }
 }
 
 pub fn tag_task_for_trial(
@@ -291,13 +396,18 @@ fn task_has_trial_approval(task: &TaskPacket, suggestion_id: &vsm_core::Suggesti
         .unwrap_or(false)
 }
 
-fn completed_trial(trial: &MutationTrial, evaluation: TrialEvaluation) -> CompletedTrial {
+fn completed_trial(
+    trial: &MutationTrial,
+    evaluation: TrialEvaluation,
+    record: StoredTrialRecord,
+) -> CompletedTrial {
     CompletedTrial {
         suggestion_id: trial.suggestion.id.clone(),
         base_genome_id: trial.base_genome_id.clone(),
         candidate_genome_id: trial.candidate_genome.id.clone(),
         candidate_genome: trial.candidate_genome.clone(),
         evaluation,
+        record,
     }
 }
 
@@ -358,7 +468,9 @@ mod tests {
         let root_id = genome.root_node_id.clone();
         let suggestion_id = suggestion.id.clone();
         let mut manager = TrialManager::default();
-        manager.start_trial(&genome, suggestion).expect("start");
+        manager
+            .start_trial(root_id.clone(), &genome, suggestion)
+            .expect("start");
 
         let task = approved_review_task(&suggestion_id);
         let router = TaskRouter::default();

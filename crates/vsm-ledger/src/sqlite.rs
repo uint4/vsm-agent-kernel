@@ -1,9 +1,12 @@
-use crate::{EventFilter, Ledger, LedgerError, LedgerEvent, TraceWindow};
+use crate::{
+    EventFilter, GenomeSnapshot, Ledger, LedgerError, LedgerEvent, StoredTrialRecord, TraceWindow,
+};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{path::Path, sync::Arc};
 use tokio::sync::Mutex;
-use vsm_core::{TaskTrace, TraceId};
+use vsm_core::{GenomeId, NodeId, OrganizationalGenome, SuggestionId, TaskTrace, TraceId};
 
 #[derive(Clone)]
 pub struct SqliteLedger {
@@ -83,6 +86,47 @@ impl SqliteLedger {
                 ON task_traces(assigned_node_id);
             CREATE INDEX IF NOT EXISTS idx_task_traces_genome
                 ON task_traces(genome_id);
+
+            CREATE TABLE IF NOT EXISTS genome_snapshots (
+                genome_id TEXT PRIMARY KEY,
+                role TEXT NOT NULL,
+                saved_at TEXT NOT NULL,
+                genome_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_genome_snapshots_role
+                ON genome_snapshots(role);
+            CREATE INDEX IF NOT EXISTS idx_genome_snapshots_saved_at
+                ON genome_snapshots(saved_at);
+
+            CREATE TABLE IF NOT EXISTS champion_genomes (
+                controller_node_id TEXT PRIMARY KEY,
+                genome_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS trial_records (
+                trial_id TEXT PRIMARY KEY,
+                controller_node_id TEXT NOT NULL,
+                base_genome_id TEXT NOT NULL,
+                candidate_genome_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                routed_tasks INTEGER NOT NULL,
+                consumed_tokens INTEGER NOT NULL,
+                trace_count INTEGER NOT NULL,
+                total_score REAL NOT NULL,
+                decision TEXT,
+                record_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_trial_records_controller_status
+                ON trial_records(controller_node_id, status);
+            CREATE INDEX IF NOT EXISTS idx_trial_records_candidate
+                ON trial_records(candidate_genome_id);
             "#,
         )
         .map_err(LedgerError::from)?;
@@ -235,6 +279,176 @@ impl Ledger for SqliteLedger {
         }
         traces.sort_by(|a, b| a.started_at.cmp(&b.started_at));
         Ok(traces)
+    }
+
+    async fn save_genome_snapshot(&self, snapshot: GenomeSnapshot) -> Result<(), LedgerError> {
+        let genome_json = serde_json::to_string(&snapshot.genome)?;
+        let metadata_json = serde_json::to_string(&snapshot.metadata)?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO genome_snapshots (
+                genome_id, role, saved_at, genome_json, metadata_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                snapshot.genome_id.to_string(),
+                snapshot.role.as_storage_key(),
+                snapshot.saved_at.to_rfc3339(),
+                genome_json,
+                metadata_json,
+            ],
+        )
+        .map_err(LedgerError::from)?;
+        Ok(())
+    }
+
+    async fn get_genome_snapshot(
+        &self,
+        genome_id: &GenomeId,
+    ) -> Result<Option<GenomeSnapshot>, LedgerError> {
+        let conn = self.conn.lock().await;
+        let row: Option<(String, String, String, String)> = conn
+            .query_row(
+                "SELECT role, saved_at, genome_json, metadata_json FROM genome_snapshots WHERE genome_id = ?1",
+                params![genome_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(LedgerError::from)?;
+
+        row.map(|(role, saved_at, genome_json, metadata_json)| {
+            let genome: OrganizationalGenome = serde_json::from_str(&genome_json)?;
+            let metadata = serde_json::from_str(&metadata_json)?;
+            let saved_at = DateTime::parse_from_rfc3339(&saved_at)
+                .map_err(|err| LedgerError::Storage(err.to_string()))?
+                .with_timezone(&Utc);
+            Ok(GenomeSnapshot {
+                genome_id: genome.id.clone(),
+                role: crate::GenomeSnapshotRole::from_storage_key(&role),
+                saved_at,
+                genome,
+                metadata,
+            })
+        })
+        .transpose()
+    }
+
+    async fn set_champion_genome_id(
+        &self,
+        controller_node_id: &NodeId,
+        genome_id: &GenomeId,
+    ) -> Result<(), LedgerError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO champion_genomes (
+                controller_node_id, genome_id, updated_at
+            ) VALUES (?1, ?2, ?3)
+            "#,
+            params![
+                controller_node_id.to_string(),
+                genome_id.to_string(),
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(LedgerError::from)?;
+        Ok(())
+    }
+
+    async fn get_champion_genome_id(
+        &self,
+        controller_node_id: &NodeId,
+    ) -> Result<Option<GenomeId>, LedgerError> {
+        let conn = self.conn.lock().await;
+        let genome_id: Option<String> = conn
+            .query_row(
+                "SELECT genome_id FROM champion_genomes WHERE controller_node_id = ?1",
+                params![controller_node_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(LedgerError::from)?;
+        Ok(genome_id.map(GenomeId::from_string))
+    }
+
+    async fn write_trial_record(&self, record: StoredTrialRecord) -> Result<(), LedgerError> {
+        let record_json = serde_json::to_string(&record)?;
+        let completed_at = record.completed_at.as_ref().map(|ts| ts.to_rfc3339());
+        let decision = record
+            .decision
+            .as_ref()
+            .map(crate::StoredTrialDecision::as_storage_key);
+        let conn = self.conn.lock().await;
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO trial_records (
+                trial_id, controller_node_id, base_genome_id, candidate_genome_id,
+                status, started_at, updated_at, completed_at, routed_tasks,
+                consumed_tokens, trace_count, total_score, decision, record_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "#,
+            params![
+                record.trial_id.to_string(),
+                record.controller_node_id.to_string(),
+                record.base_genome_id.to_string(),
+                record.candidate_genome_id.to_string(),
+                record.status.as_storage_key(),
+                record.started_at.to_rfc3339(),
+                record.updated_at.to_rfc3339(),
+                completed_at,
+                record.routed_tasks as i64,
+                record.consumed_tokens as i64,
+                record.trace_count as i64,
+                record.total_score,
+                decision,
+                record_json,
+            ],
+        )
+        .map_err(LedgerError::from)?;
+        Ok(())
+    }
+
+    async fn get_trial_record(
+        &self,
+        trial_id: &SuggestionId,
+    ) -> Result<Option<StoredTrialRecord>, LedgerError> {
+        let conn = self.conn.lock().await;
+        let payload: Option<String> = conn
+            .query_row(
+                "SELECT record_json FROM trial_records WHERE trial_id = ?1",
+                params![trial_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(LedgerError::from)?;
+        payload
+            .map(|json| serde_json::from_str(&json).map_err(LedgerError::from))
+            .transpose()
+    }
+
+    async fn get_active_trial_record(
+        &self,
+        controller_node_id: &NodeId,
+    ) -> Result<Option<StoredTrialRecord>, LedgerError> {
+        let conn = self.conn.lock().await;
+        let payload: Option<String> = conn
+            .query_row(
+                r#"
+                SELECT record_json
+                FROM trial_records
+                WHERE controller_node_id = ?1 AND status = 'active'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                "#,
+                params![controller_node_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(LedgerError::from)?;
+        payload
+            .map(|json| serde_json::from_str(&json).map_err(LedgerError::from))
+            .transpose()
     }
 }
 
