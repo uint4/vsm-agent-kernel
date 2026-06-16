@@ -2,7 +2,7 @@ use crate::{
     compare_queued_candidate_evaluations, evaluate_queued_candidate_with_replay,
     pareto_frontier_indices, replay_candidate_against_traces, tag_task_for_trial_route,
     trial_decision_key, ControllerError, DirectiveTaskMapper, System3StarAuditor, TaskRouter,
-    TrialManager,
+    TrialManager, OFFLINE_REPLAY_VERSION,
 };
 use futures_util::StreamExt;
 use std::{
@@ -326,26 +326,7 @@ impl ControllerRuntime {
                 "candidate_objectives".to_string(),
                 format_candidate_objectives(&evaluation.objectives),
             );
-            record.metadata.insert(
-                "replay_trace_count".to_string(),
-                replay.trace_count.to_string(),
-            );
-            record.metadata.insert(
-                "replay_eligible_trace_count".to_string(),
-                replay.eligible_trace_count.to_string(),
-            );
-            record.metadata.insert(
-                "replay_candidate_route_count".to_string(),
-                replay.candidate_route_count.to_string(),
-            );
-            record.metadata.insert(
-                "replay_affected_route_count".to_string(),
-                replay.affected_route_count.to_string(),
-            );
-            record.metadata.insert(
-                "replay_score".to_string(),
-                format!("{:.3}", replay.replay_score),
-            );
+            insert_replay_metadata(&mut record.metadata, &replay)?;
             let started = {
                 let mut trials = self.trials.write().await;
                 trials.activate_queued_trial(record, candidate_snapshot.genome)?
@@ -375,12 +356,20 @@ impl ControllerRuntime {
                                 "exposure_cost": evaluation.objectives.exposure_cost,
                             },
                             "historical_replay": {
+                                "offline_replay_version": OFFLINE_REPLAY_VERSION,
                                 "trace_count": replay.trace_count,
+                                "base_genome_mismatch_count": replay.base_genome_mismatch_count,
                                 "eligible_trace_count": replay.eligible_trace_count,
+                                "safety_rejected_count": replay.safety_rejected_count,
+                                "champion_route_count": replay.champion_route_count,
                                 "candidate_route_count": replay.candidate_route_count,
+                                "candidate_no_route_count": replay.candidate_no_route_count,
                                 "changed_route_count": replay.changed_route_count,
                                 "affected_route_count": replay.affected_route_count,
+                                "baseline_score": replay.baseline_score,
+                                "estimated_delta_score": replay.estimated_delta_score,
                                 "replay_score": replay.replay_score,
+                                "trace_evaluations": replay.trace_evaluations,
                                 "reasons": replay.reasons,
                             },
                         }),
@@ -535,26 +524,7 @@ impl ControllerRuntime {
                 "suggestion_source".to_string(),
                 format!("{:?}", trial.suggestion.source),
             );
-            archive.metadata.insert(
-                "replay_trace_count".to_string(),
-                replay.trace_count.to_string(),
-            );
-            archive.metadata.insert(
-                "replay_eligible_trace_count".to_string(),
-                replay.eligible_trace_count.to_string(),
-            );
-            archive.metadata.insert(
-                "replay_candidate_route_count".to_string(),
-                replay.candidate_route_count.to_string(),
-            );
-            archive.metadata.insert(
-                "replay_affected_route_count".to_string(),
-                replay.affected_route_count.to_string(),
-            );
-            archive.metadata.insert(
-                "replay_score".to_string(),
-                format!("{:.3}", replay.replay_score),
-            );
+            insert_replay_metadata(&mut archive.metadata, replay)?;
             self.ledger.write_population_archive_record(archive).await?;
         }
         Ok(())
@@ -1296,6 +1266,69 @@ fn result_is_shadow_trial(result: &TaskResult) -> bool {
             .unwrap_or(false)
 }
 
+fn insert_replay_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    replay: &crate::CandidateReplaySummary,
+) -> Result<(), ControllerError> {
+    metadata.insert(
+        "offline_replay_version".to_string(),
+        OFFLINE_REPLAY_VERSION.to_string(),
+    );
+    metadata.insert(
+        "replay_trace_count".to_string(),
+        replay.trace_count.to_string(),
+    );
+    metadata.insert(
+        "replay_base_genome_mismatch_count".to_string(),
+        replay.base_genome_mismatch_count.to_string(),
+    );
+    metadata.insert(
+        "replay_eligible_trace_count".to_string(),
+        replay.eligible_trace_count.to_string(),
+    );
+    metadata.insert(
+        "replay_safety_rejected_count".to_string(),
+        replay.safety_rejected_count.to_string(),
+    );
+    metadata.insert(
+        "replay_champion_route_count".to_string(),
+        replay.champion_route_count.to_string(),
+    );
+    metadata.insert(
+        "replay_candidate_route_count".to_string(),
+        replay.candidate_route_count.to_string(),
+    );
+    metadata.insert(
+        "replay_candidate_no_route_count".to_string(),
+        replay.candidate_no_route_count.to_string(),
+    );
+    metadata.insert(
+        "replay_changed_route_count".to_string(),
+        replay.changed_route_count.to_string(),
+    );
+    metadata.insert(
+        "replay_affected_route_count".to_string(),
+        replay.affected_route_count.to_string(),
+    );
+    metadata.insert(
+        "replay_baseline_score".to_string(),
+        format!("{:.3}", replay.baseline_score),
+    );
+    metadata.insert(
+        "replay_estimated_delta_score".to_string(),
+        format!("{:.3}", replay.estimated_delta_score),
+    );
+    metadata.insert(
+        "replay_score".to_string(),
+        format!("{:.3}", replay.replay_score),
+    );
+    metadata.insert(
+        "replay_trace_evaluations".to_string(),
+        serde_json::to_string(&replay.trace_evaluations)?,
+    );
+    Ok(())
+}
+
 fn format_candidate_objectives(objectives: &crate::CandidateObjectives) -> String {
     format!(
         "expected_value={:.3};safety={:.3};historical_fit={:.3};replay_fit={:.3};complexity_cost={:.3};exposure_cost={:.3}",
@@ -1849,6 +1882,13 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
+        assert_eq!(
+            active
+                .metadata
+                .get("offline_replay_version")
+                .map(String::as_str),
+            Some(OFFLINE_REPLAY_VERSION)
+        );
         assert!(active
             .metadata
             .get("candidate_objectives")
@@ -1858,6 +1898,15 @@ mod tests {
             .get("replay_score")
             .and_then(|value| value.parse::<f64>().ok())
             .is_some_and(|score| score > 0.0));
+        assert!(active
+            .metadata
+            .get("replay_estimated_delta_score")
+            .and_then(|value| value.parse::<f64>().ok())
+            .is_some_and(|score| score > 0.0));
+        assert!(active
+            .metadata
+            .get("replay_trace_evaluations")
+            .is_some_and(|value| value.contains("AffectedRoute")));
     }
 
     #[tokio::test]

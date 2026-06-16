@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use vsm_core::{
     score_trace, FitnessWeights, GeneSuggestion, GeneSuggestionSource, GenomeId, NodeId,
-    OrganizationalGenome, RiskClass, TaskPacket, TaskTrace, TrialMode,
+    OrganizationalGenome, RiskClass, TaskId, TaskPacket, TaskTrace, TraceId, TrialMode,
 };
 use vsm_ledger::{StoredTrialDecision, StoredTrialRecord, StoredTrialStatus};
 use vsm_runtime::{MutationTrial, TrialConfig, TrialDecision, TrialEvaluation};
@@ -19,6 +19,8 @@ const TRIAL_ROUTE_ROLE_METADATA_KEY: &str = "trial_route_role";
 const TRIAL_SHADOW_METADATA_KEY: &str = "trial_shadow";
 const TRIAL_TASK_CLASS_METADATA_KEY: &str = "task_class";
 const TRIAL_SUGGESTION_METADATA_KEY: &str = "related_suggestion_id";
+pub const OFFLINE_REPLAY_VERSION: &str = "route_counterfactual_v2";
+const MAX_REPLAY_TRACE_EVALUATIONS: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct TrialRouteDecision {
@@ -54,15 +56,47 @@ pub struct QueuedCandidateEvaluation {
     pub objectives: CandidateObjectives,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum OfflineReplayTraceStatus {
+    BaseGenomeMismatch,
+    SafetyRejected,
+    CandidateUnroutable,
+    UnchangedRoute,
+    ChangedUnaffectedRoute,
+    AffectedRoute,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OfflineReplayTraceEvaluation {
+    pub trace_id: TraceId,
+    pub task_id: TaskId,
+    pub status: OfflineReplayTraceStatus,
+    pub champion_child_id: Option<NodeId>,
+    pub candidate_child_id: Option<NodeId>,
+    pub route_changed: bool,
+    pub candidate_node_affected: bool,
+    pub route_impacted: bool,
+    pub baseline_score: f64,
+    pub estimated_delta_score: f64,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CandidateReplaySummary {
     pub trace_count: u64,
+    pub base_genome_mismatch_count: u64,
     pub eligible_trace_count: u64,
+    pub safety_rejected_count: u64,
+    pub champion_route_count: u64,
     pub candidate_route_count: u64,
+    pub candidate_no_route_count: u64,
     pub changed_route_count: u64,
     pub affected_route_count: u64,
+    pub baseline_score: f64,
+    pub estimated_delta_score: f64,
     pub replay_score: f64,
     pub reasons: Vec<String>,
+    pub trace_evaluations: Vec<OfflineReplayTraceEvaluation>,
 }
 
 #[derive(Clone, Debug)]
@@ -1175,19 +1209,82 @@ pub fn replay_candidate_against_traces(
     for trace in traces {
         summary.trace_count += 1;
         if trace.genome_id != record.base_genome_id {
+            summary.base_genome_mismatch_count += 1;
+            push_replay_trace_evaluation(
+                &mut summary,
+                OfflineReplayTraceEvaluation {
+                    trace_id: trace.id.clone(),
+                    task_id: trace.task_id.clone(),
+                    status: OfflineReplayTraceStatus::BaseGenomeMismatch,
+                    champion_child_id: None,
+                    candidate_child_id: None,
+                    route_changed: false,
+                    candidate_node_affected: false,
+                    route_impacted: false,
+                    baseline_score: 0.0,
+                    estimated_delta_score: 0.0,
+                    reason: "trace belongs to a different base genome".to_string(),
+                },
+            );
             continue;
         }
 
         let task = replay_task_from_trace(trace);
+        let baseline_score = score_trace(trace, weights);
         if !replay_task_passes_trial_limits(record, &task, trace, routed_tasks, consumed_tokens) {
+            summary.safety_rejected_count += 1;
+            push_replay_trace_evaluation(
+                &mut summary,
+                OfflineReplayTraceEvaluation {
+                    trace_id: trace.id.clone(),
+                    task_id: trace.task_id.clone(),
+                    status: OfflineReplayTraceStatus::SafetyRejected,
+                    champion_child_id: None,
+                    candidate_child_id: None,
+                    route_changed: false,
+                    candidate_node_affected: false,
+                    route_impacted: false,
+                    baseline_score,
+                    estimated_delta_score: 0.0,
+                    reason: "trace exceeds candidate trial safety limits".to_string(),
+                },
+            );
             continue;
         }
         summary.eligible_trace_count += 1;
+        summary.baseline_score += baseline_score;
 
         let champion_route =
             champion_parent.and_then(|parent| router.choose_child(champion, parent, &task).ok());
-        let Ok(candidate_route) = router.choose_child(candidate, candidate_parent, &task) else {
-            continue;
+        if champion_route.is_some() {
+            summary.champion_route_count += 1;
+        }
+        let candidate_route = match router.choose_child(candidate, candidate_parent, &task) {
+            Ok(route) => route,
+            Err(error) => {
+                summary.candidate_no_route_count += 1;
+                let estimated_delta_score =
+                    trace_replay_unroutable_delta(trace, weights, champion_route.is_some());
+                summary.estimated_delta_score += estimated_delta_score;
+                summary.replay_score = summary.estimated_delta_score;
+                push_replay_trace_evaluation(
+                    &mut summary,
+                    OfflineReplayTraceEvaluation {
+                        trace_id: trace.id.clone(),
+                        task_id: trace.task_id.clone(),
+                        status: OfflineReplayTraceStatus::CandidateUnroutable,
+                        champion_child_id: champion_route.map(|route| route.child_id),
+                        candidate_child_id: None,
+                        route_changed: false,
+                        candidate_node_affected: false,
+                        route_impacted: false,
+                        baseline_score,
+                        estimated_delta_score,
+                        reason: format!("candidate could not route replay task: {error}"),
+                    },
+                );
+                continue;
+            }
         };
 
         summary.candidate_route_count += 1;
@@ -1198,24 +1295,71 @@ pub fn replay_candidate_against_traces(
             .as_ref()
             .map(|route| route.child_id != candidate_route.child_id)
             .unwrap_or(true);
-        let affected_route = affected_nodes.contains(&candidate_route.child_id);
+        let candidate_node_affected = affected_nodes.contains(&candidate_route.child_id);
+        let route_impacted = changed_route || candidate_node_affected;
         if changed_route {
             summary.changed_route_count += 1;
         }
-        if changed_route || affected_route {
+        let estimated_delta_score = if route_impacted {
+            trace_replay_estimated_delta(trace, weights)
+        } else {
+            0.0
+        };
+        if route_impacted {
             summary.affected_route_count += 1;
-            let opportunity = trace_replay_opportunity_score(trace, weights);
-            summary.replay_score += opportunity;
+            summary.estimated_delta_score += estimated_delta_score;
+            summary.replay_score = summary.estimated_delta_score;
             if summary.reasons.len() < 8 {
                 summary.reasons.push(format!(
-                    "trace={} route={} changed={} affected={} opportunity={:.3}",
-                    trace.id, candidate_route.child_id, changed_route, affected_route, opportunity
+                    "trace={} route={} changed={} affected={} delta={:.3}",
+                    trace.id,
+                    candidate_route.child_id,
+                    changed_route,
+                    candidate_node_affected,
+                    estimated_delta_score
                 ));
             }
         }
+        let status = if candidate_node_affected {
+            OfflineReplayTraceStatus::AffectedRoute
+        } else if changed_route {
+            OfflineReplayTraceStatus::ChangedUnaffectedRoute
+        } else {
+            OfflineReplayTraceStatus::UnchangedRoute
+        };
+        let candidate_child_id = candidate_route.child_id.clone();
+        push_replay_trace_evaluation(
+            &mut summary,
+            OfflineReplayTraceEvaluation {
+                trace_id: trace.id.clone(),
+                task_id: trace.task_id.clone(),
+                status,
+                champion_child_id: champion_route.map(|route| route.child_id),
+                candidate_child_id: Some(candidate_child_id),
+                route_changed: changed_route,
+                candidate_node_affected,
+                route_impacted,
+                baseline_score,
+                estimated_delta_score,
+                reason: if route_impacted {
+                    "candidate route changes or touches the patched subtree".to_string()
+                } else {
+                    "candidate preserves the champion route".to_string()
+                },
+            },
+        );
     }
 
     Ok(summary)
+}
+
+fn push_replay_trace_evaluation(
+    summary: &mut CandidateReplaySummary,
+    evaluation: OfflineReplayTraceEvaluation,
+) {
+    if summary.trace_evaluations.len() < MAX_REPLAY_TRACE_EVALUATIONS {
+        summary.trace_evaluations.push(evaluation);
+    }
 }
 
 fn replay_task_from_trace(trace: &TaskTrace) -> TaskPacket {
@@ -1335,48 +1479,102 @@ fn risk_from_trace_metadata(trace: &TaskTrace) -> RiskClass {
     }
 }
 
-fn trace_replay_opportunity_score(trace: &TaskTrace, weights: &FitnessWeights) -> f64 {
+fn trace_replay_estimated_delta(trace: &TaskTrace, weights: &FitnessWeights) -> f64 {
     let scored = score_trace(trace, weights);
-    let mut opportunity = 1.0 + scored.max(0.0).min(20.0) * 0.25;
+    let failed = trace_failed(trace);
+    let succeeded = trace_succeeded(trace);
+    let mut delta = 0.0;
 
-    if trace.merged == Some(false) || trace.reverted == Some(true) {
-        opportunity += 5.0 + scored.abs().min(20.0) * 0.5;
-    }
-    if trace.post_merge_regression == Some(true) || trace.human_override == Some(true) {
-        opportunity += 5.0;
-    }
-    if trace.tests_passed == Some(false) || trace.review_passed == Some(false) {
-        opportunity += 2.0;
-    }
-    if !trace.files_touched.is_empty() {
-        opportunity += 1.0;
-    }
-    if !trace.tests_run.is_empty() {
-        opportunity += 1.0;
+    if failed {
+        delta += 3.0 + (-scored).max(0.0).min(30.0) * 0.35;
+        if trace.merged == Some(false) || trace.reverted == Some(true) {
+            delta += 3.0;
+        }
+        if trace.post_merge_regression == Some(true) || trace.human_override == Some(true) {
+            delta += 3.0;
+        }
+        if trace.tests_passed == Some(false) || trace.review_passed == Some(false) {
+            delta += 1.5;
+        }
+    } else if succeeded {
+        delta -= 1.5 + scored.max(0.0).min(30.0) * 0.15;
+        if !trace.tests_run.is_empty() || trace.review_passed == Some(true) {
+            delta -= 0.5;
+        }
+    } else if scored < 0.0 {
+        delta += (-scored).min(15.0) * 0.2;
+    } else {
+        delta += 0.25;
     }
 
-    opportunity
+    if failed && !trace.files_touched.is_empty() {
+        delta += 0.5;
+    }
+    if succeeded && !trace.files_touched.is_empty() {
+        delta -= 0.25;
+    }
+
+    delta.clamp(-12.0, 20.0)
+}
+
+fn trace_replay_unroutable_delta(
+    trace: &TaskTrace,
+    weights: &FitnessWeights,
+    champion_had_route: bool,
+) -> f64 {
+    if !champion_had_route {
+        return 0.0;
+    }
+
+    let scored = score_trace(trace, weights);
+    if trace_succeeded(trace) {
+        -(2.0 + scored.max(0.0).min(30.0) * 0.2)
+    } else if trace_failed(trace) {
+        -1.0
+    } else {
+        -0.5
+    }
+}
+
+fn trace_failed(trace: &TaskTrace) -> bool {
+    trace.merged == Some(false)
+        || trace.reverted == Some(true)
+        || trace.post_merge_regression == Some(true)
+        || trace.human_override == Some(true)
+        || trace.tests_passed == Some(false)
+        || trace.review_passed == Some(false)
+}
+
+fn trace_succeeded(trace: &TaskTrace) -> bool {
+    trace.merged == Some(true)
+        && trace.reverted != Some(true)
+        && trace.post_merge_regression != Some(true)
+        && trace.human_override != Some(true)
+        && trace.tests_passed != Some(false)
+        && trace.review_passed != Some(false)
 }
 
 fn replay_fit_objective(replay: &CandidateReplaySummary) -> f64 {
-    if replay.affected_route_count == 0 {
+    if replay.affected_route_count == 0 && replay.candidate_no_route_count == 0 {
         return 0.0;
     }
-    replay.replay_score.clamp(-40.0, 60.0) + replay.affected_route_count as f64
+    replay.estimated_delta_score.clamp(-40.0, 60.0) + replay.affected_route_count as f64
 }
 
 fn add_replay_adjustment(score: &mut QueuedCandidateScore, replay: &CandidateReplaySummary) {
-    if replay.affected_route_count == 0 {
+    if replay.affected_route_count == 0 && replay.candidate_no_route_count == 0 {
         return;
     }
-    let adjustment = replay.replay_score.clamp(-20.0, 40.0);
+    let adjustment = replay.estimated_delta_score.clamp(-20.0, 40.0);
     add_score(
         &mut score.total_score,
         &mut score.reasons,
         adjustment,
         format!(
-            "historical_replay_score={:.3}_affected_routes={}",
-            replay.replay_score, replay.affected_route_count
+            "historical_replay_score={:.3}_affected_routes={}_candidate_no_route={}",
+            replay.estimated_delta_score,
+            replay.affected_route_count,
+            replay.candidate_no_route_count
         ),
     );
 }
@@ -1574,7 +1772,8 @@ mod tests {
     use chrono::Duration;
     use vsm_core::{
         GeneSuggestion, GeneSuggestionSource, GenomeId, LeafOperationSpec, OrganizationalGenome,
-        OrganizationalGenomePatch, RiskClass, TaskId, TaskPacket, TaskTrace, TrialMode, ViableNode,
+        OrganizationalGenomePatch, PromptComponent, PromptOrigin, PromptSection, RiskClass, TaskId,
+        TaskPacket, TaskTrace, TrialMode, ViableNode,
     };
 
     use crate::TaskRouter;
@@ -2044,6 +2243,12 @@ mod tests {
         assert_eq!(replay.changed_route_count, 1);
         assert_eq!(replay.affected_route_count, 1);
         assert!(replay.replay_score > 0.0);
+        assert_eq!(replay.replay_score, replay.estimated_delta_score);
+        assert_eq!(replay.trace_evaluations.len(), 1);
+        assert_eq!(
+            replay.trace_evaluations[0].status,
+            OfflineReplayTraceStatus::AffectedRoute
+        );
 
         let evaluation = evaluate_queued_candidate_with_replay(&record, &[], &replay);
         assert!(evaluation.objectives.replay_fit > 0.0);
@@ -2052,5 +2257,72 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("historical_replay_score")));
+    }
+
+    #[test]
+    fn historical_replay_penalizes_touching_successful_affected_routes() {
+        let root = ViableNode::new_metasystem("root");
+        let root_id = root.id.clone();
+        let mut genome = OrganizationalGenome::new(root);
+        let coder = ViableNode::new_leaf("coder", LeafOperationSpec::coding());
+        let coder_id = coder.id.clone();
+        genome.add_child(&root_id, coder).expect("coder");
+
+        let mut suggestion = GeneSuggestion::new(
+            root_id.clone(),
+            root_id.clone(),
+            GeneSuggestionSource::System3StarAudit,
+            OrganizationalGenomePatch::AddPromptComponent {
+                node_id: coder_id.clone(),
+                section: PromptSection::BehaviorRules,
+                component: PromptComponent {
+                    id: "stable-route-test".to_string(),
+                    text: "preserve successful coding behavior".to_string(),
+                    tags: vec!["replay-test".to_string()],
+                    origin: PromptOrigin::Mutation,
+                    active: true,
+                },
+            },
+            "tune coder prompt",
+        );
+        suggestion.trial_mode = TrialMode::Canary;
+        suggestion.safety_limits.max_tasks = Some(10);
+        suggestion.safety_limits.max_traffic_share_basis_points = Some(10_000);
+        let record = queued_record_for_suggestion(&genome, suggestion.clone());
+        let trial = MutationTrial::from_suggestion(&genome, suggestion).expect("candidate genome");
+
+        let mut trace = TaskTrace::started(TaskId::new(), genome.id.clone(), coder_id.clone());
+        trace.files_touched.push("src/lib.rs".to_string());
+        trace.tests_run.push("cargo test".to_string());
+        trace.tests_passed = Some(true);
+        trace.merged = Some(true);
+        trace.outcome_score = 1.0;
+
+        let replay = replay_candidate_against_traces(
+            &TaskRouter::default(),
+            &genome.root_node_id,
+            &genome,
+            &trial.candidate_genome,
+            &record,
+            &[trace],
+            &FitnessWeights::default(),
+        )
+        .expect("replay");
+
+        assert_eq!(replay.trace_count, 1);
+        assert_eq!(replay.eligible_trace_count, 1);
+        assert_eq!(replay.champion_route_count, 1);
+        assert_eq!(replay.candidate_route_count, 1);
+        assert_eq!(replay.changed_route_count, 0);
+        assert_eq!(replay.affected_route_count, 1);
+        assert!(replay.estimated_delta_score < 0.0);
+        assert_eq!(replay.replay_score, replay.estimated_delta_score);
+        assert_eq!(
+            replay.trace_evaluations[0].status,
+            OfflineReplayTraceStatus::AffectedRoute
+        );
+
+        let evaluation = evaluate_queued_candidate_with_replay(&record, &[], &replay);
+        assert!(evaluation.objectives.replay_fit < 0.0);
     }
 }
