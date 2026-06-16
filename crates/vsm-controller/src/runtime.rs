@@ -5,7 +5,10 @@ use crate::{
     TrialManager,
 };
 use futures_util::StreamExt;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use tokio::sync::RwLock;
 use vsm_core::{
     envelope_for_task, AuditReport, BuiltinPayloadType, ChannelPriority, Directive, FitnessWeights,
@@ -13,7 +16,8 @@ use vsm_core::{
     TaskResult, TaskTrace, Transport, VsmChannelType,
 };
 use vsm_ledger::{
-    EventFilter, GenomeSnapshot, GenomeSnapshotRole, Ledger, LedgerEvent, LedgerEventKind,
+    CandidateObjectiveSnapshot, EventFilter, GenomeSnapshot, GenomeSnapshotRole, Ledger,
+    LedgerEvent, LedgerEventKind, PopulationArchiveRecord, PopulationArchiveStatus,
     StoredTrialRecord, TraceWindow,
 };
 use vsm_runtime::{TrialConfig, TrialDecision, TrialEvaluation};
@@ -271,6 +275,14 @@ impl ControllerRuntime {
             .collect::<Vec<_>>();
         let frontier_indices = pareto_frontier_indices(&evaluations);
         let frontier_size = frontier_indices.len();
+        let frontier_index_set = frontier_indices.iter().copied().collect::<BTreeSet<_>>();
+        let archive_inputs = selectable
+            .iter()
+            .enumerate()
+            .map(|(index, (record, _, evaluation, replay))| {
+                (index, record.clone(), evaluation.clone(), replay.clone())
+            })
+            .collect::<Vec<_>>();
         let mut frontier_index = 0;
         selectable.retain(|_| {
             let keep = frontier_indices.contains(&frontier_index);
@@ -287,6 +299,13 @@ impl ControllerRuntime {
         if let Some((mut record, candidate_snapshot, evaluation, replay)) =
             selectable.into_iter().next()
         {
+            self.write_population_archive_records(
+                &archive_inputs,
+                &frontier_index_set,
+                &record.trial_id,
+                frontier_size,
+            )
+            .await?;
             record.metadata.insert(
                 "selection_policy".to_string(),
                 "pareto_empirical_candidate_score_v1".to_string(),
@@ -472,6 +491,72 @@ impl ControllerRuntime {
                 .with_suggestion(record.trial_id),
             )
             .await?;
+        Ok(())
+    }
+
+    async fn write_population_archive_records(
+        &self,
+        archive_inputs: &[(
+            usize,
+            StoredTrialRecord,
+            crate::QueuedCandidateEvaluation,
+            crate::CandidateReplaySummary,
+        )],
+        frontier_indices: &BTreeSet<usize>,
+        selected_trial_id: &vsm_core::SuggestionId,
+        frontier_size: usize,
+    ) -> Result<(), ControllerError> {
+        for (candidate_index, trial, evaluation, replay) in archive_inputs {
+            let status = if &trial.trial_id == selected_trial_id {
+                PopulationArchiveStatus::SelectedForTrial
+            } else if frontier_indices.contains(candidate_index) {
+                PopulationArchiveStatus::ParetoFrontier
+            } else {
+                PopulationArchiveStatus::Dominated
+            };
+            let mut archive = PopulationArchiveRecord::new(
+                self.node_id.clone(),
+                trial,
+                status,
+                "pareto_empirical_candidate_score_v1",
+                evaluation.score.total_score,
+                frontier_size,
+                snapshot_candidate_objectives(&evaluation.objectives),
+            );
+            archive.metadata.insert(
+                "selection_reasons".to_string(),
+                evaluation.score.reasons.join("|"),
+            );
+            archive.metadata.insert(
+                "trial_mode".to_string(),
+                format!("{:?}", trial.suggestion.trial_mode),
+            );
+            archive.metadata.insert(
+                "suggestion_source".to_string(),
+                format!("{:?}", trial.suggestion.source),
+            );
+            archive.metadata.insert(
+                "replay_trace_count".to_string(),
+                replay.trace_count.to_string(),
+            );
+            archive.metadata.insert(
+                "replay_eligible_trace_count".to_string(),
+                replay.eligible_trace_count.to_string(),
+            );
+            archive.metadata.insert(
+                "replay_candidate_route_count".to_string(),
+                replay.candidate_route_count.to_string(),
+            );
+            archive.metadata.insert(
+                "replay_affected_route_count".to_string(),
+                replay.affected_route_count.to_string(),
+            );
+            archive.metadata.insert(
+                "replay_score".to_string(),
+                format!("{:.3}", replay.replay_score),
+            );
+            self.ledger.write_population_archive_record(archive).await?;
+        }
         Ok(())
     }
 
@@ -1223,6 +1308,19 @@ fn format_candidate_objectives(objectives: &crate::CandidateObjectives) -> Strin
     )
 }
 
+fn snapshot_candidate_objectives(
+    objectives: &crate::CandidateObjectives,
+) -> CandidateObjectiveSnapshot {
+    CandidateObjectiveSnapshot {
+        expected_value: objectives.expected_value,
+        safety: objectives.safety,
+        historical_fit: objectives.historical_fit,
+        replay_fit: objectives.replay_fit,
+        complexity_cost: objectives.complexity_cost,
+        exposure_cost: objectives.exposure_cost,
+    }
+}
+
 fn task_priority(task: &TaskPacket) -> ChannelPriority {
     match &task.risk {
         vsm_core::RiskClass::Low => ChannelPriority::Normal,
@@ -1248,7 +1346,9 @@ mod tests {
         LeafOperationSpec, OrganizationalGenome, OrganizationalGenomePatch, Subscription,
         System5Policy, TaskId, TaskPacket, TaskTrace, Transport, TrialMode, ViableNode,
     };
-    use vsm_ledger::{InMemoryLedger, StoredTrialRecord, StoredTrialStatus};
+    use vsm_ledger::{
+        InMemoryLedger, PopulationArchiveStatus, StoredTrialRecord, StoredTrialStatus,
+    };
     use vsm_runtime::InMemoryTransport;
 
     fn genome_and_review_suggestion() -> (OrganizationalGenome, GeneSuggestion, vsm_core::NodeId) {
@@ -1630,6 +1730,78 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
+    }
+
+    #[tokio::test]
+    async fn queued_activation_persists_population_archive_frontier() {
+        let (genome, mut dominated_suggestion, _reviewer_id) = genome_and_review_suggestion();
+        dominated_suggestion.trial_mode = TrialMode::Direct;
+        dominated_suggestion.source = GeneSuggestionSource::Other("manual".to_string());
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+
+        let dominated_candidate = controller
+            .queue_candidate_from_suggestion(dominated_suggestion)
+            .await
+            .expect("queue dominated candidate");
+
+        let reviewer = ViableNode::new_leaf("archive-reviewer", LeafOperationSpec::reviewer());
+        let mut dominant_suggestion = GeneSuggestion::new(
+            root_id.clone(),
+            root_id.clone(),
+            GeneSuggestionSource::AlgedonicSignal,
+            OrganizationalGenomePatch::AddChild {
+                parent_id: root_id.clone(),
+                child: reviewer,
+            },
+            "archive dominant canary",
+        );
+        dominant_suggestion.trial_mode = TrialMode::Canary;
+        dominant_suggestion.safety_limits.max_tasks = Some(10);
+        dominant_suggestion.safety_limits.max_token_budget = Some(5_000);
+        dominant_suggestion
+            .safety_limits
+            .max_traffic_share_basis_points = Some(500);
+        dominant_suggestion.evidence.push("pain signal".to_string());
+        let dominant_candidate = controller
+            .queue_candidate_from_suggestion(dominant_suggestion)
+            .await
+            .expect("queue dominant candidate");
+
+        let started = controller
+            .start_next_queued_trial()
+            .await
+            .expect("start best candidate")
+            .expect("candidate started");
+        assert_eq!(started, dominant_candidate);
+
+        let population = ledger
+            .population_archive_records(&root_id, 10)
+            .await
+            .expect("population archive");
+        assert_eq!(population.len(), 2);
+        let selected = population
+            .iter()
+            .find(|record| record.candidate_genome_id == dominant_candidate)
+            .expect("selected archive");
+        assert_eq!(selected.status, PopulationArchiveStatus::SelectedForTrial);
+        assert_eq!(selected.pareto_frontier_size, 1);
+        assert!(selected.selection_score > 0.0);
+        assert!(selected.objectives.safety > 0.0);
+
+        let dominated = population
+            .iter()
+            .find(|record| record.candidate_genome_id == dominated_candidate)
+            .expect("dominated archive");
+        assert_eq!(dominated.status, PopulationArchiveStatus::Dominated);
+
+        let pareto = ledger
+            .pareto_archive_records(&root_id, 10)
+            .await
+            .expect("pareto archive");
+        assert_eq!(pareto.len(), 1);
+        assert_eq!(pareto[0].candidate_genome_id, dominant_candidate);
     }
 
     #[tokio::test]

@@ -154,6 +154,76 @@ mod tests {
         assert_eq!(completed_records.len(), 1);
         assert_eq!(completed_records[0].trial_id, completed.trial_id);
         assert_eq!(completed_records[0].status, StoredTrialStatus::Promoted);
+
+        let mut dominated_archive = PopulationArchiveRecord::new(
+            controller.clone(),
+            &completed,
+            PopulationArchiveStatus::Dominated,
+            "test_policy",
+            1.0,
+            1,
+            CandidateObjectiveSnapshot {
+                expected_value: 1.0,
+                safety: 1.0,
+                historical_fit: 0.0,
+                replay_fit: 0.0,
+                complexity_cost: 10.0,
+                exposure_cost: 10.0,
+            },
+        );
+        dominated_archive
+            .metadata
+            .insert("test".to_string(), "dominated".to_string());
+        ledger
+            .write_population_archive_record(dominated_archive.clone())
+            .await
+            .expect("dominated archive");
+
+        let mut selected_archive = PopulationArchiveRecord::new(
+            controller.clone(),
+            &completed,
+            PopulationArchiveStatus::SelectedForTrial,
+            "test_policy",
+            10.0,
+            1,
+            CandidateObjectiveSnapshot {
+                expected_value: 10.0,
+                safety: 5.0,
+                historical_fit: 1.0,
+                replay_fit: 2.0,
+                complexity_cost: 5.0,
+                exposure_cost: 1.0,
+            },
+        );
+        selected_archive.trial_id = queued_id.clone();
+        selected_archive.candidate_genome_id = vsm_core::GenomeId::new();
+        ledger
+            .write_population_archive_record(selected_archive.clone())
+            .await
+            .expect("selected archive");
+
+        let loaded_archive = ledger
+            .get_population_archive_record(&selected_archive.trial_id)
+            .await
+            .expect("load archive")
+            .expect("archive exists");
+        assert_eq!(
+            loaded_archive.status,
+            PopulationArchiveStatus::SelectedForTrial
+        );
+
+        let population = ledger
+            .population_archive_records(&controller, 10)
+            .await
+            .expect("population archive");
+        assert_eq!(population.len(), 2);
+
+        let pareto = ledger
+            .pareto_archive_records(&controller, 10)
+            .await
+            .expect("pareto archive");
+        assert_eq!(pareto.len(), 1);
+        assert_eq!(pareto[0].trial_id, selected_archive.trial_id);
     }
 
     #[tokio::test]

@@ -178,3 +178,89 @@ impl StoredTrialRecord {
             .insert("rejection_reason".to_string(), reason.into());
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PopulationArchiveStatus {
+    Dominated,
+    ParetoFrontier,
+    SelectedForTrial,
+    Promoted,
+    Pruned,
+    Rejected,
+    Archived,
+}
+
+impl PopulationArchiveStatus {
+    pub fn as_storage_key(&self) -> &'static str {
+        match self {
+            Self::Dominated => "dominated",
+            Self::ParetoFrontier => "pareto_frontier",
+            Self::SelectedForTrial => "selected_for_trial",
+            Self::Promoted => "promoted",
+            Self::Pruned => "pruned",
+            Self::Rejected => "rejected",
+            Self::Archived => "archived",
+        }
+    }
+
+    pub fn is_pareto_member(&self) -> bool {
+        matches!(
+            self,
+            Self::ParetoFrontier | Self::SelectedForTrial | Self::Promoted
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CandidateObjectiveSnapshot {
+    pub expected_value: f64,
+    pub safety: f64,
+    pub historical_fit: f64,
+    pub replay_fit: f64,
+    pub complexity_cost: f64,
+    pub exposure_cost: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PopulationArchiveRecord {
+    pub trial_id: SuggestionId,
+    pub controller_node_id: NodeId,
+    pub base_genome_id: GenomeId,
+    pub candidate_genome_id: GenomeId,
+    pub status: PopulationArchiveStatus,
+    pub archived_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub selection_policy: String,
+    pub selection_score: f64,
+    pub pareto_frontier_size: usize,
+    pub objectives: CandidateObjectiveSnapshot,
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl PopulationArchiveRecord {
+    pub fn new(
+        controller_node_id: NodeId,
+        trial: &StoredTrialRecord,
+        status: PopulationArchiveStatus,
+        selection_policy: impl Into<String>,
+        selection_score: f64,
+        pareto_frontier_size: usize,
+        objectives: CandidateObjectiveSnapshot,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            trial_id: trial.trial_id.clone(),
+            controller_node_id,
+            base_genome_id: trial.base_genome_id.clone(),
+            candidate_genome_id: trial.candidate_genome_id.clone(),
+            status,
+            archived_at: now,
+            updated_at: now,
+            selection_policy: selection_policy.into(),
+            selection_score,
+            pareto_frontier_size,
+            objectives,
+            metadata: BTreeMap::new(),
+        }
+    }
+}

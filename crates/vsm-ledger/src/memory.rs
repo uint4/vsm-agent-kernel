@@ -1,5 +1,6 @@
 use crate::{
-    EventFilter, GenomeSnapshot, Ledger, LedgerError, LedgerEvent, StoredTrialRecord, TraceWindow,
+    EventFilter, GenomeSnapshot, Ledger, LedgerError, LedgerEvent, PopulationArchiveRecord,
+    StoredTrialRecord, TraceWindow,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -14,6 +15,7 @@ pub struct InMemoryLedger {
     genomes: Arc<Mutex<BTreeMap<GenomeId, GenomeSnapshot>>>,
     champion_genomes: Arc<Mutex<BTreeMap<NodeId, GenomeId>>>,
     trials: Arc<Mutex<BTreeMap<SuggestionId, StoredTrialRecord>>>,
+    population_archive: Arc<Mutex<BTreeMap<SuggestionId, PopulationArchiveRecord>>>,
 }
 
 impl InMemoryLedger {
@@ -196,6 +198,66 @@ impl Ledger for InMemoryLedger {
                             | crate::StoredTrialStatus::Rejected
                             | crate::StoredTrialStatus::Archived
                     )
+            })
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        if limit > 0 && records.len() > limit {
+            records.truncate(limit);
+        }
+        Ok(records)
+    }
+
+    async fn write_population_archive_record(
+        &self,
+        record: PopulationArchiveRecord,
+    ) -> Result<(), LedgerError> {
+        self.population_archive
+            .lock()
+            .await
+            .insert(record.trial_id.clone(), record);
+        Ok(())
+    }
+
+    async fn get_population_archive_record(
+        &self,
+        trial_id: &SuggestionId,
+    ) -> Result<Option<PopulationArchiveRecord>, LedgerError> {
+        Ok(self.population_archive.lock().await.get(trial_id).cloned())
+    }
+
+    async fn population_archive_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<PopulationArchiveRecord>, LedgerError> {
+        let mut records: Vec<PopulationArchiveRecord> = self
+            .population_archive
+            .lock()
+            .await
+            .values()
+            .filter(|record| &record.controller_node_id == controller_node_id)
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        if limit > 0 && records.len() > limit {
+            records.truncate(limit);
+        }
+        Ok(records)
+    }
+
+    async fn pareto_archive_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<PopulationArchiveRecord>, LedgerError> {
+        let mut records: Vec<PopulationArchiveRecord> = self
+            .population_archive
+            .lock()
+            .await
+            .values()
+            .filter(|record| {
+                &record.controller_node_id == controller_node_id && record.status.is_pareto_member()
             })
             .cloned()
             .collect();

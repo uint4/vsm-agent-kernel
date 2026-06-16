@@ -1,5 +1,6 @@
 use crate::{
-    EventFilter, GenomeSnapshot, Ledger, LedgerError, LedgerEvent, StoredTrialRecord, TraceWindow,
+    EventFilter, GenomeSnapshot, Ledger, LedgerError, LedgerEvent, PopulationArchiveRecord,
+    StoredTrialRecord, TraceWindow,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -127,6 +128,27 @@ impl SqliteLedger {
                 ON trial_records(controller_node_id, status);
             CREATE INDEX IF NOT EXISTS idx_trial_records_candidate
                 ON trial_records(candidate_genome_id);
+
+            CREATE TABLE IF NOT EXISTS population_archive_records (
+                trial_id TEXT PRIMARY KEY,
+                controller_node_id TEXT NOT NULL,
+                base_genome_id TEXT NOT NULL,
+                candidate_genome_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                archived_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                selection_policy TEXT NOT NULL,
+                selection_score REAL NOT NULL,
+                pareto_frontier_size INTEGER NOT NULL,
+                record_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_population_archive_controller
+                ON population_archive_records(controller_node_id);
+            CREATE INDEX IF NOT EXISTS idx_population_archive_controller_status
+                ON population_archive_records(controller_node_id, status);
+            CREATE INDEX IF NOT EXISTS idx_population_archive_candidate
+                ON population_archive_records(candidate_genome_id);
             "#,
         )
         .map_err(LedgerError::from)?;
@@ -497,6 +519,121 @@ impl Ledger for SqliteLedger {
                 FROM trial_records
                 WHERE controller_node_id = ?1
                   AND status IN ('promoted', 'pruned', 'rejected', 'archived')
+                ORDER BY updated_at DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(LedgerError::from)?;
+        let rows = stmt
+            .query_map(params![controller_node_id.to_string(), limit], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(LedgerError::from)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let json = row.map_err(LedgerError::from)?;
+            records.push(serde_json::from_str(&json)?);
+        }
+        Ok(records)
+    }
+
+    async fn write_population_archive_record(
+        &self,
+        record: PopulationArchiveRecord,
+    ) -> Result<(), LedgerError> {
+        let record_json = serde_json::to_string(&record)?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO population_archive_records (
+                trial_id, controller_node_id, base_genome_id, candidate_genome_id,
+                status, archived_at, updated_at, selection_policy, selection_score,
+                pareto_frontier_size, record_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "#,
+            params![
+                record.trial_id.to_string(),
+                record.controller_node_id.to_string(),
+                record.base_genome_id.to_string(),
+                record.candidate_genome_id.to_string(),
+                record.status.as_storage_key(),
+                record.archived_at.to_rfc3339(),
+                record.updated_at.to_rfc3339(),
+                record.selection_policy,
+                record.selection_score,
+                record.pareto_frontier_size as i64,
+                record_json,
+            ],
+        )
+        .map_err(LedgerError::from)?;
+        Ok(())
+    }
+
+    async fn get_population_archive_record(
+        &self,
+        trial_id: &SuggestionId,
+    ) -> Result<Option<PopulationArchiveRecord>, LedgerError> {
+        let conn = self.conn.lock().await;
+        let payload: Option<String> = conn
+            .query_row(
+                "SELECT record_json FROM population_archive_records WHERE trial_id = ?1",
+                params![trial_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(LedgerError::from)?;
+        payload
+            .map(|json| serde_json::from_str(&json).map_err(LedgerError::from))
+            .transpose()
+    }
+
+    async fn population_archive_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<PopulationArchiveRecord>, LedgerError> {
+        let limit = limit.max(1) as i64;
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT record_json
+                FROM population_archive_records
+                WHERE controller_node_id = ?1
+                ORDER BY updated_at DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(LedgerError::from)?;
+        let rows = stmt
+            .query_map(params![controller_node_id.to_string(), limit], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(LedgerError::from)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let json = row.map_err(LedgerError::from)?;
+            records.push(serde_json::from_str(&json)?);
+        }
+        Ok(records)
+    }
+
+    async fn pareto_archive_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<PopulationArchiveRecord>, LedgerError> {
+        let limit = limit.max(1) as i64;
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT record_json
+                FROM population_archive_records
+                WHERE controller_node_id = ?1
+                  AND status IN ('pareto_frontier', 'selected_for_trial', 'promoted')
                 ORDER BY updated_at DESC
                 LIMIT ?2
                 "#,

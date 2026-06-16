@@ -1,6 +1,6 @@
 use crate::{
-    EventFilter, GenomeSnapshot, GenomeSnapshotRole, LedgerError, LedgerEvent, StoredTrialRecord,
-    TraceWindow,
+    EventFilter, GenomeSnapshot, GenomeSnapshotRole, LedgerError, LedgerEvent,
+    PopulationArchiveRecord, StoredTrialRecord, TraceWindow,
 };
 use async_trait::async_trait;
 use vsm_core::{GenomeId, NodeId, OrganizationalGenome, SuggestionId, TaskTrace, TraceId};
@@ -85,6 +85,28 @@ pub trait Ledger: Send + Sync {
         controller_node_id: &NodeId,
         limit: usize,
     ) -> Result<Vec<StoredTrialRecord>, LedgerError>;
+
+    async fn write_population_archive_record(
+        &self,
+        record: PopulationArchiveRecord,
+    ) -> Result<(), LedgerError>;
+
+    async fn get_population_archive_record(
+        &self,
+        trial_id: &SuggestionId,
+    ) -> Result<Option<PopulationArchiveRecord>, LedgerError>;
+
+    async fn population_archive_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<PopulationArchiveRecord>, LedgerError>;
+
+    async fn pareto_archive_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<PopulationArchiveRecord>, LedgerError>;
 
     async fn subtree_task_traces(
         &self,
