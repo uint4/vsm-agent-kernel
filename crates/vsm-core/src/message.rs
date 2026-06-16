@@ -128,6 +128,79 @@ pub struct ResourceBargain {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceAllocationStatus {
+    Approved,
+    PartiallyApproved,
+    Denied,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceAllocationDecision {
+    pub requested_by: NodeId,
+    pub task_id: Option<TaskId>,
+    pub status: ResourceAllocationStatus,
+    pub approved_tokens: Option<u64>,
+    pub approved_tool_permissions: Vec<String>,
+    pub denied_tool_permissions: Vec<String>,
+    pub approved_context_refs: Vec<String>,
+    pub denied_context_refs: Vec<String>,
+    pub reasons: Vec<String>,
+    pub allocation_policy: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnvironmentSignalKind {
+    Observation,
+    UserFeedback,
+    Artifact,
+    DependencyChange,
+    CapabilityChange,
+    Risk,
+    Opportunity,
+    Other(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentSignal {
+    pub observed_by_node_id: Option<NodeId>,
+    pub target_node_id: Option<NodeId>,
+    pub related_task_id: Option<TaskId>,
+    pub related_suggestion_id: Option<SuggestionId>,
+    pub source_environment: String,
+    pub target_environment: Option<String>,
+    pub kind: EnvironmentSignalKind,
+    pub summary: String,
+    pub evidence: Vec<String>,
+    pub severity: Option<u8>,
+    pub metadata: BTreeMap<String, String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl EnvironmentSignal {
+    pub fn new(
+        kind: EnvironmentSignalKind,
+        source_environment: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            observed_by_node_id: None,
+            target_node_id: None,
+            related_task_id: None,
+            related_suggestion_id: None,
+            source_environment: source_environment.into(),
+            target_environment: None,
+            kind,
+            summary: summary.into(),
+            evidence: vec![],
+            severity: None,
+            metadata: BTreeMap::new(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Command {
     pub issued_by: NodeId,
     pub target: NodeId,
@@ -167,6 +240,8 @@ pub enum BuiltinPayloadType {
     TaskPacket,
     TaskResult,
     ResourceBargain,
+    ResourceAllocationDecision,
+    EnvironmentSignal,
     Command,
     AuditRequest,
     AuditReport,
@@ -181,6 +256,8 @@ impl BuiltinPayloadType {
             Self::TaskPacket => "vsm.task_packet",
             Self::TaskResult => "vsm.task_result",
             Self::ResourceBargain => "vsm.resource_bargain",
+            Self::ResourceAllocationDecision => "vsm.resource_allocation_decision",
+            Self::EnvironmentSignal => "vsm.environment_signal",
             Self::Command => "vsm.command",
             Self::AuditRequest => "vsm.audit_request",
             Self::AuditReport => "vsm.audit_report",

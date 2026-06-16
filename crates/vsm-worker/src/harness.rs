@@ -24,7 +24,14 @@ impl Default for WorkerHarnessConfig {
         Self {
             queue_name: None,
             durable_subscription: false,
-            subscription_channels: vec![VsmChannelType::ResourceBargaining],
+            subscription_channels: vec![
+                VsmChannelType::ResourceBargaining,
+                VsmChannelType::Command,
+                VsmChannelType::System2Coordination,
+                VsmChannelType::ManagementToOperation,
+                VsmChannelType::OperationToOperation,
+                VsmChannelType::Audit,
+            ],
             publish_results: true,
         }
     }
@@ -389,9 +396,26 @@ fn require_capability(
 
 #[cfg(test)]
 mod tests {
-    use vsm_core::{GenomeId, NodeId, SuggestionId, TaskId, TaskPacket, TaskResult, TaskTrace};
+    use vsm_core::{
+        GenomeId, NodeId, SuggestionId, TaskId, TaskPacket, TaskResult, TaskTrace, VsmChannelType,
+    };
 
-    use super::{copy_replay_metadata, copy_trial_metadata};
+    use super::{copy_replay_metadata, copy_trial_metadata, WorkerHarnessConfig};
+
+    #[test]
+    fn worker_default_subscribes_to_executable_vsm_channels() {
+        let config = WorkerHarnessConfig::default();
+        for channel in [
+            VsmChannelType::ResourceBargaining,
+            VsmChannelType::Command,
+            VsmChannelType::System2Coordination,
+            VsmChannelType::ManagementToOperation,
+            VsmChannelType::OperationToOperation,
+            VsmChannelType::Audit,
+        ] {
+            assert!(config.subscription_channels.contains(&channel));
+        }
+    }
 
     #[test]
     fn trial_metadata_is_copied_to_result_and_trace() {

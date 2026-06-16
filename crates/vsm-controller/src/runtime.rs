@@ -4,6 +4,7 @@ use crate::{
     trial_decision_key, ControllerError, DirectiveTaskMapper, System3StarAuditor, TaskRouter,
     TrialManager, OFFLINE_REPLAY_VERSION,
 };
+use chrono::Utc;
 use futures_util::StreamExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,9 +12,11 @@ use std::{
 };
 use tokio::sync::RwLock;
 use vsm_core::{
-    envelope_for_task, AuditReport, BuiltinPayloadType, ChannelPriority, Directive, FitnessWeights,
-    GeneSuggestion, MessageEnvelope, NodeId, OrganizationalGenome, Subscription, TaskPacket,
-    TaskResult, TaskTrace, Transport, VsmChannelType,
+    envelope_for_task, AuditReport, AuditRequest, BuiltinPayloadType, ChannelPriority,
+    Command as VsmCommand, Directive, EnvironmentSignal, FitnessWeights, GeneSuggestion,
+    GeneSuggestionSource, MessageEnvelope, NodeId, OrganizationalGenome,
+    ResourceAllocationDecision, ResourceAllocationStatus, ResourceBargain, RiskClass, Subscription,
+    TaskPacket, TaskResult, TaskTrace, Transport, VsmChannelType,
 };
 use vsm_ledger::{
     CandidateObjectiveSnapshot, EventFilter, GenomeSnapshot, GenomeSnapshotRole, Ledger,
@@ -43,7 +46,13 @@ impl Default for ControllerConfig {
             subscription_channels: vec![
                 VsmChannelType::OperationToEnvironment,
                 VsmChannelType::ResourceBargaining,
+                VsmChannelType::Command,
+                VsmChannelType::System2Coordination,
+                VsmChannelType::Audit,
+                VsmChannelType::ThreeFourHomeostat,
                 VsmChannelType::ManagementToOperation,
+                VsmChannelType::FutureProbeToEnvironment,
+                VsmChannelType::EnvironmentToEnvironment,
                 VsmChannelType::Algedonic,
             ],
             publish_channel: VsmChannelType::ResourceBargaining,
@@ -226,6 +235,7 @@ impl ControllerRuntime {
                 limit: Some(200),
             })
             .await?;
+        let environment_pressure = self.recent_environment_pressure().await?;
         let replay_weights = self.trials.read().await.fitness_weights();
         let mut selectable = Vec::new();
 
@@ -266,6 +276,8 @@ impl ControllerRuntime {
             )?;
             let evaluation =
                 evaluate_queued_candidate_with_replay(&record, &completed_history, &replay);
+            let evaluation =
+                apply_environment_pressure(&record, evaluation, &environment_pressure);
             selectable.push((record, candidate_snapshot, evaluation, replay));
         }
 
@@ -326,6 +338,7 @@ impl ControllerRuntime {
                 "candidate_objectives".to_string(),
                 format_candidate_objectives(&evaluation.objectives),
             );
+            insert_environment_pressure_metadata(&mut record.metadata, &environment_pressure);
             insert_replay_metadata(&mut record.metadata, &replay)?;
             let started = {
                 let mut trials = self.trials.write().await;
@@ -355,6 +368,7 @@ impl ControllerRuntime {
                                 "complexity_cost": evaluation.objectives.complexity_cost,
                                 "exposure_cost": evaluation.objectives.exposure_cost,
                             },
+                            "environment_pressure": environment_pressure.as_json(),
                             "historical_replay": {
                                 "offline_replay_version": OFFLINE_REPLAY_VERSION,
                                 "trace_count": replay.trace_count,
@@ -399,6 +413,19 @@ impl ControllerRuntime {
 
     pub async fn active_candidate_genome(&self) -> Option<OrganizationalGenome> {
         self.trials.read().await.active_candidate_genome()
+    }
+
+    async fn recent_environment_pressure(&self) -> Result<EnvironmentPressureSummary, ControllerError> {
+        let events = self
+            .ledger
+            .recent_events(EventFilter {
+                kinds: environment_signal_event_kinds(),
+                node_id: Some(self.node_id.clone()),
+                limit: Some(100),
+                ..EventFilter::default()
+            })
+            .await?;
+        Ok(EnvironmentPressureSummary::from_events(&events))
     }
 
     pub async fn load_persisted_champion(
@@ -699,6 +726,62 @@ impl ControllerRuntime {
                     reason: route.reason,
                 })
             }
+            payload if payload == BuiltinPayloadType::Command.as_str() => {
+                let command: VsmCommand = envelope.payload_as()?;
+                let task = task_from_command(&command);
+                self.ledger
+                    .append_event(
+                        LedgerEvent::new(
+                            LedgerEventKind::Other("command_received".to_string()),
+                            serde_json::json!({
+                                "issued_by": command.issued_by.to_string(),
+                                "target": command.target.to_string(),
+                                "title": command.title,
+                                "non_negotiable": command.non_negotiable,
+                                "legal_or_policy_basis": command.legal_or_policy_basis,
+                                "source_channel": format!("{:?}", envelope.channel_type),
+                                "correlation_id": envelope.correlation_id,
+                                "causation_id": envelope.causation_id.as_ref().map(ToString::to_string),
+                            }),
+                        )?
+                        .with_node(self.node_id.clone())
+                        .with_task(task.id.clone()),
+                    )
+                    .await?;
+                self.log_task_mapped(&task, None, &envelope, "system3_command_channel")
+                    .await?;
+                let route = self.route_task(task, Some(&envelope)).await?;
+                Ok(ControllerHandleOutcome::RoutedTask {
+                    task: route.task,
+                    child_id: route.child_id,
+                    reason: route.reason,
+                })
+            }
+            payload if payload == BuiltinPayloadType::ResourceBargain.as_str() => {
+                let bargain: ResourceBargain = envelope.payload_as()?;
+                self.handle_resource_bargain(bargain, &envelope).await?;
+                Ok(ControllerHandleOutcome::Ignored)
+            }
+            payload if payload == BuiltinPayloadType::EnvironmentSignal.as_str() => {
+                let signal: EnvironmentSignal = envelope.payload_as()?;
+                self.record_environment_signal(signal, &envelope).await?;
+                Ok(ControllerHandleOutcome::Ignored)
+            }
+            payload if payload == BuiltinPayloadType::AuditRequest.as_str() => {
+                let request: AuditRequest = envelope.payload_as()?;
+                self.record_audit_request(request, &envelope).await?;
+                Ok(ControllerHandleOutcome::Ignored)
+            }
+            payload if payload == BuiltinPayloadType::AuditReport.as_str() => {
+                let report: AuditReport = envelope.payload_as()?;
+                self.ingest_audit_report(report, &envelope).await?;
+                Ok(ControllerHandleOutcome::Ignored)
+            }
+            payload if payload == BuiltinPayloadType::GeneSuggestion.as_str() => {
+                let suggestion: GeneSuggestion = envelope.payload_as()?;
+                self.ingest_gene_suggestion(suggestion, &envelope).await?;
+                Ok(ControllerHandleOutcome::Ignored)
+            }
             payload if payload == BuiltinPayloadType::TaskResult.as_str() => {
                 let result: TaskResult = envelope.payload_as()?;
                 let event = LedgerEvent::new(LedgerEventKind::TaskResultReceived, &result)?
@@ -712,9 +795,8 @@ impl ControllerRuntime {
                 Ok(ControllerHandleOutcome::ReceivedTaskResult(result))
             }
             payload if payload == BuiltinPayloadType::AlgedonicSignal.as_str() => {
-                let event =
-                    LedgerEvent::for_message(LedgerEventKind::AlgedonicSignalReceived, &envelope)?;
-                self.ledger.append_event(event).await?;
+                let signal: vsm_core::AlgedonicSignal = envelope.payload_as()?;
+                self.handle_algedonic_signal(signal, &envelope).await?;
                 Ok(ControllerHandleOutcome::Ignored)
             }
             _ => Ok(ControllerHandleOutcome::Ignored),
@@ -763,11 +845,352 @@ impl ControllerRuntime {
         Ok(())
     }
 
+    async fn record_environment_signal(
+        &self,
+        signal: EnvironmentSignal,
+        envelope: &MessageEnvelope,
+    ) -> Result<(), ControllerError> {
+        let event_name = environment_signal_event_name(&envelope.channel_type);
+        let mut event = LedgerEvent::new(
+            LedgerEventKind::Other(event_name.to_string()),
+            serde_json::json!({
+                "observed_by_node_id": signal.observed_by_node_id.as_ref().map(ToString::to_string),
+                "target_node_id": signal.target_node_id.as_ref().map(ToString::to_string),
+                "related_task_id": signal.related_task_id.as_ref().map(ToString::to_string),
+                "related_suggestion_id": signal.related_suggestion_id.as_ref().map(ToString::to_string),
+                "source_environment": signal.source_environment,
+                "target_environment": signal.target_environment,
+                "kind": format!("{:?}", signal.kind),
+                "summary": signal.summary,
+                "evidence": signal.evidence,
+                "severity": signal.severity,
+                "source_channel": format!("{:?}", envelope.channel_type),
+                "source_payload_type": envelope.payload_type.clone(),
+                "causation_id": envelope.causation_id.as_ref().map(ToString::to_string),
+                "correlation_id": envelope.correlation_id.clone(),
+                "metadata": signal.metadata,
+            }),
+        )?
+        .with_node(self.node_id.clone());
+        if let Some(task_id) = signal.related_task_id {
+            event = event.with_task(task_id);
+        }
+        if let Some(suggestion_id) = signal.related_suggestion_id {
+            event = event.with_suggestion(suggestion_id);
+        }
+        if let Some(correlation_id) = envelope.correlation_id.clone() {
+            event = event.with_correlation(correlation_id);
+        }
+        event.metadata.insert(
+            "source_channel".to_string(),
+            format!("{:?}", envelope.channel_type),
+        );
+        event
+            .metadata
+            .insert("event_name".to_string(), event_name.to_string());
+        self.ledger.append_event(event).await?;
+        Ok(())
+    }
+
+    async fn handle_resource_bargain(
+        &self,
+        bargain: ResourceBargain,
+        envelope: &MessageEnvelope,
+    ) -> Result<(), ControllerError> {
+        let decision = {
+            let genome = self.genome.read().await;
+            allocate_resource_bargain(&genome, &self.node_id, &bargain)
+        };
+
+        let mut event = LedgerEvent::new(
+            LedgerEventKind::Other("resource_allocation_decision".to_string()),
+            &decision,
+        )?
+        .with_node(self.node_id.clone());
+        if let Some(task_id) = decision.task_id.clone() {
+            event = event.with_task(task_id);
+        }
+        if let Some(correlation_id) = envelope.correlation_id.clone() {
+            event = event.with_correlation(correlation_id);
+        }
+        event.metadata.insert(
+            "source_channel".to_string(),
+            format!("{:?}", envelope.channel_type),
+        );
+        event.metadata.insert(
+            "allocation_status".to_string(),
+            format!("{:?}", decision.status),
+        );
+        self.ledger.append_event(event).await?;
+
+        let mut response = MessageEnvelope::new(
+            VsmChannelType::ResourceBargaining,
+            BuiltinPayloadType::ResourceAllocationDecision.as_str(),
+            &decision,
+        )?
+        .with_route(
+            Some(self.node_id.clone()),
+            Some(decision.requested_by.clone()),
+        );
+        response.priority = match &decision.status {
+            ResourceAllocationStatus::Approved => ChannelPriority::Normal,
+            ResourceAllocationStatus::PartiallyApproved => ChannelPriority::High,
+            ResourceAllocationStatus::Denied => ChannelPriority::High,
+        };
+        response.correlation_id = envelope
+            .correlation_id
+            .clone()
+            .or_else(|| Some(envelope.id.to_string()));
+        response.causation_id = Some(envelope.id.clone());
+        response.trace = envelope.trace.clone();
+        response.trace.push(self.node_id.clone());
+        response.metadata.insert(
+            "allocation_policy".to_string(),
+            decision.allocation_policy.clone(),
+        );
+        response.metadata.insert(
+            "allocation_status".to_string(),
+            format!("{:?}", decision.status),
+        );
+
+        if self.config.append_message_events {
+            self.ledger
+                .append_event(LedgerEvent::for_message(
+                    LedgerEventKind::MessagePublished,
+                    &response,
+                )?)
+                .await?;
+        }
+        self.transport.publish(response).await?;
+        Ok(())
+    }
+
+    async fn handle_algedonic_signal(
+        &self,
+        signal: vsm_core::AlgedonicSignal,
+        envelope: &MessageEnvelope,
+    ) -> Result<(), ControllerError> {
+        let mut signal_event =
+            LedgerEvent::for_message(LedgerEventKind::AlgedonicSignalReceived, envelope)?
+                .with_node(self.node_id.clone());
+        if let Some(task_id) = signal.related_task_id.clone() {
+            signal_event = signal_event.with_task(task_id);
+        }
+        if let Some(suggestion_id) = signal.related_suggestion_id.clone() {
+            signal_event = signal_event.with_suggestion(suggestion_id);
+        }
+        signal_event
+            .metadata
+            .insert("severity".to_string(), signal.severity.to_string());
+        signal_event
+            .metadata
+            .insert("valence".to_string(), format!("{:?}", signal.valence));
+        self.ledger.append_event(signal_event).await?;
+
+        let Some(policy) = signal.override_policy.clone() else {
+            return Ok(());
+        };
+
+        let mut actions = Vec::new();
+        if policy.freeze_mutation {
+            actions.push("freeze_mutation".to_string());
+            if let Some(suggestion_id) = signal.related_suggestion_id.clone() {
+                if let Some(mut record) = self.ledger.get_trial_record(&suggestion_id).await? {
+                    if record.status == vsm_ledger::StoredTrialStatus::Queued {
+                        record.mark_rejected(format!(
+                            "algedonic freeze_mutation: {}",
+                            signal.message
+                        ));
+                        self.ledger.write_trial_record(record.clone()).await?;
+                        self.ledger
+                            .append_event(
+                                LedgerEvent::new(
+                                    LedgerEventKind::TrialRejected,
+                                    serde_json::json!({
+                                        "trial_id": record.trial_id.to_string(),
+                                        "base_genome_id": record.base_genome_id.to_string(),
+                                        "candidate_genome_id": record.candidate_genome_id.to_string(),
+                                        "reason": "algedonic freeze_mutation",
+                                        "message": signal.message.clone(),
+                                    }),
+                                )?
+                                .with_node(self.node_id.clone())
+                                .with_genome(record.candidate_genome_id)
+                                .with_suggestion(record.trial_id),
+                            )
+                            .await?;
+                    } else {
+                        actions.push(format!(
+                            "freeze_mutation_recorded_for_nonqueued_trial={}",
+                            suggestion_id
+                        ));
+                    }
+                } else {
+                    actions.push(format!("freeze_mutation_no_trial_record={suggestion_id}"));
+                }
+            } else {
+                actions.push("freeze_mutation_no_related_suggestion".to_string());
+            }
+        }
+        if policy.pause_subtree {
+            actions.push("pause_subtree_requested".to_string());
+        }
+        if policy.escalate_to_root {
+            actions.push("escalate_to_root_requested".to_string());
+        }
+        if policy.require_human_confirmation {
+            actions.push("require_human_confirmation".to_string());
+        }
+
+        let mut override_event = LedgerEvent::new(
+            LedgerEventKind::Other("algedonic_override_applied".to_string()),
+            serde_json::json!({
+                "source_channel": format!("{:?}", envelope.channel_type),
+                "valence": format!("{:?}", signal.valence),
+                "severity": signal.severity,
+                "target_node_id": signal.target_node_id.as_ref().map(ToString::to_string),
+                "related_task_id": signal.related_task_id.as_ref().map(ToString::to_string),
+                "related_suggestion_id": signal.related_suggestion_id.as_ref().map(ToString::to_string),
+                "message": signal.message.clone(),
+                "actions": actions,
+                "policy": {
+                    "pause_subtree": policy.pause_subtree,
+                    "escalate_to_root": policy.escalate_to_root,
+                    "freeze_mutation": policy.freeze_mutation,
+                    "require_human_confirmation": policy.require_human_confirmation,
+                },
+            }),
+        )?
+        .with_node(self.node_id.clone());
+        if let Some(task_id) = signal.related_task_id {
+            override_event = override_event.with_task(task_id);
+        }
+        if let Some(suggestion_id) = signal.related_suggestion_id {
+            override_event = override_event.with_suggestion(suggestion_id);
+        }
+        self.ledger.append_event(override_event).await?;
+        Ok(())
+    }
+
+    async fn record_audit_request(
+        &self,
+        request: AuditRequest,
+        envelope: &MessageEnvelope,
+    ) -> Result<(), ControllerError> {
+        let genome_id = { self.genome.read().await.id.clone() };
+        let mut event = LedgerEvent::new(
+            LedgerEventKind::AuditStarted,
+            serde_json::json!({
+                "requested_by": request.requested_by.to_string(),
+                "target_node_id": request.target_node_id.to_string(),
+                "window_tasks": request.window_tasks,
+                "include_gene_suggestions": request.include_gene_suggestions,
+                "source_channel": format!("{:?}", envelope.channel_type),
+                "source_payload_type": envelope.payload_type.clone(),
+                "causation_id": envelope.causation_id.as_ref().map(ToString::to_string),
+                "correlation_id": envelope.correlation_id.clone(),
+            }),
+        )?
+        .with_node(self.node_id.clone())
+        .with_genome(genome_id);
+        event.metadata.insert(
+            "source_channel".to_string(),
+            format!("{:?}", envelope.channel_type),
+        );
+        if let Some(correlation_id) = envelope.correlation_id.clone() {
+            event = event.with_correlation(correlation_id);
+        }
+        self.ledger.append_event(event).await?;
+        Ok(())
+    }
+
+    async fn ingest_audit_report(
+        &self,
+        report: AuditReport,
+        envelope: &MessageEnvelope,
+    ) -> Result<(), ControllerError> {
+        let genome_id = { self.genome.read().await.id.clone() };
+        let suggestions = gene_suggestions_from_audit_report(&self.node_id, &report, envelope);
+
+        let mut audit_event = LedgerEvent::new(LedgerEventKind::AuditCompleted, &report)?
+            .with_node(self.node_id.clone())
+            .with_genome(genome_id.clone());
+        audit_event.metadata.insert(
+            "source_channel".to_string(),
+            format!("{:?}", envelope.channel_type),
+        );
+        audit_event.metadata.insert(
+            "suggestion_count".to_string(),
+            suggestions.len().to_string(),
+        );
+        if let Some(correlation_id) = envelope.correlation_id.clone() {
+            audit_event = audit_event.with_correlation(correlation_id);
+        }
+        self.ledger.append_event(audit_event).await?;
+
+        for suggestion in suggestions {
+            self.ingest_gene_suggestion_with_genome(suggestion, envelope, genome_id.clone())
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn ingest_gene_suggestion(
+        &self,
+        suggestion: GeneSuggestion,
+        envelope: &MessageEnvelope,
+    ) -> Result<vsm_core::GenomeId, ControllerError> {
+        let genome_id = { self.genome.read().await.id.clone() };
+        self.ingest_gene_suggestion_with_genome(suggestion, envelope, genome_id)
+            .await
+    }
+
+    async fn ingest_gene_suggestion_with_genome(
+        &self,
+        suggestion: GeneSuggestion,
+        envelope: &MessageEnvelope,
+        genome_id: vsm_core::GenomeId,
+    ) -> Result<vsm_core::GenomeId, ControllerError> {
+        let mut suggestion = suggestion;
+        if !suggestion
+            .evidence
+            .iter()
+            .any(|evidence| evidence.starts_with("source_channel="))
+        {
+            suggestion
+                .evidence
+                .push(format!("source_channel={:?}", envelope.channel_type));
+        }
+
+        let mut suggestion_event =
+            LedgerEvent::new(LedgerEventKind::GeneSuggestionCreated, &suggestion)?
+                .with_node(self.node_id.clone())
+                .with_genome(genome_id)
+                .with_suggestion(suggestion.id.clone());
+        suggestion_event.metadata.insert(
+            "source_channel".to_string(),
+            format!("{:?}", envelope.channel_type),
+        );
+        suggestion_event.metadata.insert(
+            "source_payload_type".to_string(),
+            envelope.payload_type.clone(),
+        );
+        if let Some(correlation_id) = envelope.correlation_id.clone() {
+            suggestion_event = suggestion_event.with_correlation(correlation_id);
+        }
+        self.ledger.append_event(suggestion_event).await?;
+
+        self.queue_candidate_from_suggestion(suggestion).await
+    }
+
     async fn route_task(
         &self,
         mut task: TaskPacket,
         incoming: Option<&MessageEnvelope>,
     ) -> Result<RoutedTask, ControllerError> {
+        annotate_incoming_task_channel(&mut task, incoming, &self.node_id);
+
         let maybe_trial_route = {
             let trials = self.trials.read().await;
             trials.choose_trial_route(&self.config.router, &self.node_id, &task)?
@@ -893,7 +1316,7 @@ impl ControllerRuntime {
 
     async fn publish_routed_task(
         &self,
-        task: TaskPacket,
+        mut task: TaskPacket,
         incoming: Option<&MessageEnvelope>,
         child_id: NodeId,
         reason: String,
@@ -902,6 +1325,8 @@ impl ControllerRuntime {
         suggestion_id: Option<vsm_core::SuggestionId>,
         is_shadow_route: bool,
     ) -> Result<RoutedTask, ControllerError> {
+        annotate_outbound_task_channel(&mut task, &child_id);
+
         let parent_name = {
             let genome = self.genome.read().await;
             genome
@@ -927,6 +1352,11 @@ impl ControllerRuntime {
                 suggestion_id: suggestion_id.as_ref().map(ToString::to_string),
                 routed_genome_id: genome_id.to_string(),
                 source_channel: incoming.map(|incoming| format!("{:?}", incoming.channel_type)),
+                outbound_channel: format!(
+                    "{:?}",
+                    routed_task_channel(&self.config.publish_channel, incoming)
+                ),
+                channel_priority: format!("{:?}", routed_task_priority(&task, incoming)),
                 causation_id: incoming
                     .and_then(|incoming| incoming.causation_id.as_ref())
                     .map(ToString::to_string),
@@ -938,6 +1368,28 @@ impl ControllerRuntime {
                     .cloned(),
                 trial_exposure_bucket: task.metadata.get("trial_exposure_bucket").cloned(),
                 trial_route_role: task.metadata.get("trial_route_role").cloned(),
+                handoff_kind: task.metadata.get("handoff_kind").cloned(),
+                handoff_channel: task.metadata.get("handoff_channel").cloned(),
+                handoff_source_node_id: task.metadata.get("handoff_source_node_id").cloned(),
+                handoff_target_node_id: task.metadata.get("handoff_target_node_id").cloned(),
+                handoff_via_controller_node_id: task
+                    .metadata
+                    .get("handoff_via_controller_node_id")
+                    .cloned(),
+                handoff_correlation_id: task.metadata.get("handoff_correlation_id").cloned(),
+                handoff_causation_id: task.metadata.get("handoff_causation_id").cloned(),
+                handoff_envelope_id: task.metadata.get("handoff_envelope_id").cloned(),
+                management_kind: task.metadata.get("management_kind").cloned(),
+                management_channel: task.metadata.get("management_channel").cloned(),
+                management_source_node_id: task.metadata.get("management_source_node_id").cloned(),
+                management_target_node_id: task.metadata.get("management_target_node_id").cloned(),
+                management_via_controller_node_id: task
+                    .metadata
+                    .get("management_via_controller_node_id")
+                    .cloned(),
+                management_correlation_id: task.metadata.get("management_correlation_id").cloned(),
+                management_causation_id: task.metadata.get("management_causation_id").cloned(),
+                management_envelope_id: task.metadata.get("management_envelope_id").cloned(),
             },
         )?
         .with_genome(genome_id.clone())
@@ -979,8 +1431,8 @@ impl ControllerRuntime {
 
         let mut envelope = envelope_for_task(&task)?
             .with_route(Some(self.node_id.clone()), Some(child_id.clone()));
-        envelope.channel_type = self.config.publish_channel.clone();
-        envelope.priority = task_priority(&task);
+        envelope.channel_type = routed_task_channel(&self.config.publish_channel, incoming);
+        envelope.priority = routed_task_priority(&task, incoming);
         envelope.correlation_id = incoming
             .and_then(|incoming| incoming.correlation_id.clone())
             .or_else(|| incoming.map(|incoming| incoming.id.to_string()))
@@ -990,7 +1442,8 @@ impl ControllerRuntime {
             .map(|incoming| incoming.trace.clone())
             .unwrap_or_default();
         envelope.trace.push(self.node_id.clone());
-        envelope.metadata = routed_envelope_metadata(&reason);
+        envelope.metadata = routed_envelope_metadata(&reason, incoming, &envelope.channel_type);
+        copy_channel_metadata_to_envelope(&task, &mut envelope);
 
         if self.config.append_message_events {
             self.ledger
@@ -1245,12 +1698,30 @@ struct TaskRoutedPayload {
     suggestion_id: Option<String>,
     routed_genome_id: String,
     source_channel: Option<String>,
+    outbound_channel: String,
+    channel_priority: String,
     causation_id: Option<String>,
     correlation_id: Option<String>,
     trial_mode: Option<String>,
     trial_exposure_basis_points: Option<String>,
     trial_exposure_bucket: Option<String>,
     trial_route_role: Option<String>,
+    handoff_kind: Option<String>,
+    handoff_channel: Option<String>,
+    handoff_source_node_id: Option<String>,
+    handoff_target_node_id: Option<String>,
+    handoff_via_controller_node_id: Option<String>,
+    handoff_correlation_id: Option<String>,
+    handoff_causation_id: Option<String>,
+    handoff_envelope_id: Option<String>,
+    management_kind: Option<String>,
+    management_channel: Option<String>,
+    management_source_node_id: Option<String>,
+    management_target_node_id: Option<String>,
+    management_via_controller_node_id: Option<String>,
+    management_correlation_id: Option<String>,
+    management_causation_id: Option<String>,
+    management_envelope_id: Option<String>,
 }
 
 fn result_is_shadow_trial(result: &TaskResult) -> bool {
@@ -1264,6 +1735,343 @@ fn result_is_shadow_trial(result: &TaskResult) -> bool {
             .get("trial_route_role")
             .map(|value| value == "shadow")
             .unwrap_or(false)
+}
+
+fn task_from_command(command: &VsmCommand) -> TaskPacket {
+    let mut task = TaskPacket::new(command.title.clone(), command.body.clone());
+    task.assigned_to = Some(command.target.clone());
+    task.risk = if command.legal_or_policy_basis.is_some() {
+        RiskClass::Critical
+    } else if command.non_negotiable {
+        RiskClass::High
+    } else {
+        RiskClass::Medium
+    };
+
+    if command.non_negotiable {
+        task.constraints.push("non-negotiable command".to_string());
+    }
+    if let Some(basis) = &command.legal_or_policy_basis {
+        task.constraints.push(format!("policy basis: {basis}"));
+        task.authority_refs.push(basis.clone());
+        task.metadata
+            .insert("legal_or_policy_basis".to_string(), basis.clone());
+    }
+
+    task.metadata
+        .insert("vsm_channel".to_string(), "Command".to_string());
+    task.metadata.insert(
+        "command_issued_by".to_string(),
+        command.issued_by.to_string(),
+    );
+    task.metadata.insert(
+        "command_non_negotiable".to_string(),
+        command.non_negotiable.to_string(),
+    );
+    task
+}
+
+fn allocate_resource_bargain(
+    genome: &OrganizationalGenome,
+    controller_node_id: &NodeId,
+    bargain: &ResourceBargain,
+) -> ResourceAllocationDecision {
+    let mut reasons = Vec::new();
+    let mut approved_tokens = None;
+    let mut approved_tool_permissions = Vec::new();
+    let mut denied_tool_permissions = Vec::new();
+    let mut approved_context_refs = Vec::new();
+    let mut denied_context_refs = Vec::new();
+
+    let parent = match genome.get_node(controller_node_id) {
+        Ok(parent) => parent,
+        Err(error) => {
+            return resource_allocation_decision(
+                bargain,
+                ResourceAllocationStatus::Denied,
+                None,
+                vec![],
+                bargain.requested_tool_permissions.clone(),
+                vec![],
+                bargain.requested_context_refs.clone(),
+                vec![format!("controller node unavailable: {error}")],
+            );
+        }
+    };
+    let requester = match genome.get_node(&bargain.requested_by) {
+        Ok(requester) => requester,
+        Err(error) => {
+            return resource_allocation_decision(
+                bargain,
+                ResourceAllocationStatus::Denied,
+                None,
+                vec![],
+                bargain.requested_tool_permissions.clone(),
+                vec![],
+                bargain.requested_context_refs.clone(),
+                vec![format!("requesting node unavailable: {error}")],
+            );
+        }
+    };
+
+    if !parent.system_3.can_allocate_budget {
+        return resource_allocation_decision(
+            bargain,
+            ResourceAllocationStatus::Denied,
+            None,
+            vec![],
+            bargain.requested_tool_permissions.clone(),
+            vec![],
+            bargain.requested_context_refs.clone(),
+            vec!["System 3 resource allocation disabled by genome policy".to_string()],
+        );
+    }
+
+    if let Some(requested_tokens) = bargain.requested_tokens {
+        let token_cap = resource_token_cap(genome, parent, requester);
+        approved_tokens = match token_cap {
+            Some(cap) if cap == 0 => {
+                reasons
+                    .push("token request denied because effective token cap is zero".to_string());
+                None
+            }
+            Some(cap) if requested_tokens > cap => {
+                reasons.push(format!(
+                    "requested_tokens={} capped_to={} by System 3 resource policy",
+                    requested_tokens, cap
+                ));
+                Some(cap)
+            }
+            Some(_) | None => Some(requested_tokens),
+        };
+    }
+
+    for permission in &bargain.requested_tool_permissions {
+        if tool_permission_allowed(requester, permission) {
+            approved_tool_permissions.push(permission.clone());
+        } else {
+            denied_tool_permissions.push(permission.clone());
+            reasons.push(format!("tool_permission_denied={permission}"));
+        }
+    }
+
+    for context_ref in &bargain.requested_context_refs {
+        if context_ref_allowed(requester, context_ref) {
+            approved_context_refs.push(context_ref.clone());
+        } else {
+            denied_context_refs.push(context_ref.clone());
+            reasons.push(format!("context_ref_denied={context_ref}"));
+        }
+    }
+
+    let requested_count = bargain.requested_tokens.map(|_| 1).unwrap_or(0)
+        + bargain.requested_tool_permissions.len()
+        + bargain.requested_context_refs.len();
+    let approved_count = approved_tokens.map(|_| 1).unwrap_or(0)
+        + approved_tool_permissions.len()
+        + approved_context_refs.len();
+    let denied_count = denied_tool_permissions.len()
+        + denied_context_refs.len()
+        + usize::from(bargain.requested_tokens.is_some() && approved_tokens.is_none());
+
+    let status = if requested_count == 0 {
+        reasons.push("no concrete resource request supplied".to_string());
+        ResourceAllocationStatus::Denied
+    } else if approved_count == requested_count && denied_count == 0 {
+        reasons.push("resource bargain approved within System 3 policy".to_string());
+        ResourceAllocationStatus::Approved
+    } else if approved_count > 0 {
+        ResourceAllocationStatus::PartiallyApproved
+    } else {
+        ResourceAllocationStatus::Denied
+    };
+
+    resource_allocation_decision(
+        bargain,
+        status,
+        approved_tokens,
+        approved_tool_permissions,
+        denied_tool_permissions,
+        approved_context_refs,
+        denied_context_refs,
+        reasons,
+    )
+}
+
+fn resource_allocation_decision(
+    bargain: &ResourceBargain,
+    status: ResourceAllocationStatus,
+    approved_tokens: Option<u64>,
+    approved_tool_permissions: Vec<String>,
+    denied_tool_permissions: Vec<String>,
+    approved_context_refs: Vec<String>,
+    denied_context_refs: Vec<String>,
+    reasons: Vec<String>,
+) -> ResourceAllocationDecision {
+    ResourceAllocationDecision {
+        requested_by: bargain.requested_by.clone(),
+        task_id: bargain.task_id.clone(),
+        status,
+        approved_tokens,
+        approved_tool_permissions,
+        denied_tool_permissions,
+        approved_context_refs,
+        denied_context_refs,
+        reasons,
+        allocation_policy: "system3_genome_resource_policy_v1".to_string(),
+        created_at: Utc::now(),
+    }
+}
+
+fn environment_signal_event_name(channel_type: &VsmChannelType) -> &'static str {
+    match channel_type {
+        VsmChannelType::OperationToEnvironment => "operation_environment_signal",
+        VsmChannelType::FutureProbeToEnvironment => "future_probe_environment_signal",
+        VsmChannelType::EnvironmentToEnvironment => "environment_interaction_signal",
+        _ => "environment_signal",
+    }
+}
+
+fn resource_token_cap(
+    genome: &OrganizationalGenome,
+    parent: &vsm_core::ViableNode,
+    requester: &vsm_core::ViableNode,
+) -> Option<u64> {
+    let mut caps = Vec::new();
+    if let Some(cap) = parent.system_3.default_task_budget_tokens {
+        caps.push(cap);
+    }
+    if let Some(cap) = requester.context_policy.max_total_task_tokens {
+        caps.push(cap);
+    }
+    for channel in &genome.channels {
+        if channel.channel_type != VsmChannelType::ResourceBargaining {
+            continue;
+        }
+        let connects_parent_child =
+            channel.from.as_ref() == Some(&parent.id) && channel.to.as_ref() == Some(&requester.id);
+        let connects_child_parent =
+            channel.from.as_ref() == Some(&requester.id) && channel.to.as_ref() == Some(&parent.id);
+        if connects_parent_child || connects_child_parent {
+            if let Some(cap) = channel.max_token_budget_per_epoch {
+                caps.push(cap);
+            }
+        }
+    }
+    caps.into_iter().min()
+}
+
+fn tool_permission_allowed(node: &vsm_core::ViableNode, permission: &str) -> bool {
+    if node
+        .permissions
+        .denied_tools
+        .iter()
+        .any(|denied| denied == permission)
+    {
+        return false;
+    }
+    if !node.permissions.allowed_tools.is_empty() {
+        return node
+            .permissions
+            .allowed_tools
+            .iter()
+            .any(|allowed| allowed == permission);
+    }
+    if node.tools.is_empty() {
+        return true;
+    }
+    node.tools.iter().any(|tool| {
+        tool.enabled
+            && (tool.name == permission
+                || tool
+                    .permissions
+                    .iter()
+                    .any(|tool_permission| tool_permission == permission))
+    })
+}
+
+fn context_ref_allowed(node: &vsm_core::ViableNode, context_ref: &str) -> bool {
+    if node.context_policy.fixed_context_refs.is_empty()
+        && node.context_policy.retrievable_context_refs.is_empty()
+    {
+        return true;
+    }
+    node.context_policy
+        .fixed_context_refs
+        .iter()
+        .chain(node.context_policy.retrievable_context_refs.iter())
+        .any(|allowed| allowed == context_ref)
+}
+
+fn gene_suggestions_from_audit_report(
+    controller_node_id: &NodeId,
+    report: &AuditReport,
+    envelope: &MessageEnvelope,
+) -> Vec<GeneSuggestion> {
+    let suggested_by = envelope
+        .source_node_id
+        .clone()
+        .unwrap_or_else(|| controller_node_id.clone());
+    let evidence = audit_report_evidence(report, envelope);
+    let hypothesis = audit_report_hypothesis(report);
+
+    report
+        .suggested_patches
+        .iter()
+        .cloned()
+        .map(|patch| {
+            let mut suggestion = GeneSuggestion::new(
+                suggested_by.clone(),
+                report.target_node_id.clone(),
+                GeneSuggestionSource::System3StarAudit,
+                patch,
+                hypothesis.clone(),
+            );
+            suggestion.evidence = evidence.clone();
+            suggestion.safety_limits.max_tasks = Some(10);
+            suggestion.safety_limits.max_token_budget = Some(100_000);
+            suggestion.safety_limits.requires_approval = true;
+            suggestion
+        })
+        .collect()
+}
+
+fn audit_report_evidence(report: &AuditReport, envelope: &MessageEnvelope) -> Vec<String> {
+    let mut evidence = vec![format!("source_channel={:?}", envelope.channel_type)];
+    if let Some(correlation_id) = &envelope.correlation_id {
+        evidence.push(format!("correlation_id={correlation_id}"));
+    }
+
+    for finding in &report.findings {
+        evidence.push(format!(
+            "finding={} severity={} related_nodes={} related_tasks={}",
+            finding.title,
+            finding.severity,
+            finding.related_nodes.len(),
+            finding.related_tasks.len()
+        ));
+        evidence.extend(finding.evidence.iter().cloned());
+    }
+
+    if evidence.len() == 1 {
+        evidence.push("audit report supplied suggested patch without findings".to_string());
+    }
+
+    evidence
+}
+
+fn audit_report_hypothesis(report: &AuditReport) -> String {
+    if report.findings.is_empty() {
+        return "System 3* audit report suggested a bounded organizational mutation.".to_string();
+    }
+
+    let titles = report
+        .findings
+        .iter()
+        .map(|finding| finding.title.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("System 3* audit report suggests a bounded organizational mutation: {titles}")
 }
 
 fn insert_replay_metadata(
@@ -1363,9 +2171,238 @@ fn task_priority(task: &TaskPacket) -> ChannelPriority {
     }
 }
 
-fn routed_envelope_metadata(reason: &str) -> BTreeMap<String, String> {
+fn routed_task_channel(
+    configured_default: &VsmChannelType,
+    incoming: Option<&MessageEnvelope>,
+) -> VsmChannelType {
+    match incoming.map(|incoming| &incoming.channel_type) {
+        Some(VsmChannelType::Command) => VsmChannelType::Command,
+        Some(VsmChannelType::System2Coordination) => VsmChannelType::System2Coordination,
+        Some(VsmChannelType::Audit) => VsmChannelType::Audit,
+        Some(VsmChannelType::ThreeFourHomeostat) => VsmChannelType::ThreeFourHomeostat,
+        Some(VsmChannelType::ManagementToOperation) => VsmChannelType::ManagementToOperation,
+        Some(VsmChannelType::OperationToOperation) => VsmChannelType::OperationToOperation,
+        Some(VsmChannelType::Algedonic) => VsmChannelType::Algedonic,
+        _ => configured_default.clone(),
+    }
+}
+
+fn routed_task_priority(task: &TaskPacket, incoming: Option<&MessageEnvelope>) -> ChannelPriority {
+    let base = task_priority(task);
+    match incoming.map(|incoming| &incoming.channel_type) {
+        Some(VsmChannelType::Command) => {
+            if task
+                .metadata
+                .get("command_non_negotiable")
+                .map(|value| value == "true")
+                .unwrap_or(false)
+                || matches!(task.risk, RiskClass::Critical)
+            {
+                ChannelPriority::Critical
+            } else {
+                elevate_priority(base, ChannelPriority::High)
+            }
+        }
+        Some(VsmChannelType::System2Coordination)
+        | Some(VsmChannelType::Audit)
+        | Some(VsmChannelType::ThreeFourHomeostat) => elevate_priority(base, ChannelPriority::High),
+        Some(VsmChannelType::Algedonic) => ChannelPriority::Interrupt,
+        _ => base,
+    }
+}
+
+const HANDOFF_METADATA_KEYS: &[&str] = &[
+    "handoff_kind",
+    "handoff_channel",
+    "handoff_source_node_id",
+    "handoff_target_node_id",
+    "handoff_via_controller_node_id",
+    "handoff_correlation_id",
+    "handoff_causation_id",
+    "handoff_envelope_id",
+];
+
+const MANAGEMENT_METADATA_KEYS: &[&str] = &[
+    "management_kind",
+    "management_channel",
+    "management_source_node_id",
+    "management_target_node_id",
+    "management_via_controller_node_id",
+    "management_correlation_id",
+    "management_causation_id",
+    "management_envelope_id",
+];
+
+fn annotate_incoming_task_channel(
+    task: &mut TaskPacket,
+    incoming: Option<&MessageEnvelope>,
+    controller_node_id: &NodeId,
+) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+
+    task.metadata.insert(
+        "vsm_source_channel".to_string(),
+        format!("{:?}", incoming.channel_type),
+    );
+    task.metadata.insert(
+        "vsm_source_payload_type".to_string(),
+        incoming.payload_type.clone(),
+    );
+
+    match incoming.channel_type {
+        VsmChannelType::OperationToOperation => {
+            annotate_incoming_peer_handoff(task, incoming, controller_node_id);
+        }
+        VsmChannelType::ManagementToOperation => {
+            annotate_incoming_management_to_operation(task, incoming, controller_node_id);
+        }
+        _ => {}
+    }
+}
+
+fn annotate_incoming_peer_handoff(
+    task: &mut TaskPacket,
+    incoming: &MessageEnvelope,
+    controller_node_id: &NodeId,
+) {
+    task.metadata.insert(
+        "handoff_kind".to_string(),
+        "operation_to_operation".to_string(),
+    );
+    task.metadata.insert(
+        "handoff_channel".to_string(),
+        "OperationToOperation".to_string(),
+    );
+    task.metadata.insert(
+        "handoff_via_controller_node_id".to_string(),
+        controller_node_id.to_string(),
+    );
+    task.metadata
+        .insert("handoff_envelope_id".to_string(), incoming.id.to_string());
+    if let Some(source_node_id) = &incoming.source_node_id {
+        task.metadata.insert(
+            "handoff_source_node_id".to_string(),
+            source_node_id.to_string(),
+        );
+    }
+    if let Some(correlation_id) = &incoming.correlation_id {
+        task.metadata
+            .insert("handoff_correlation_id".to_string(), correlation_id.clone());
+    }
+    if let Some(causation_id) = &incoming.causation_id {
+        task.metadata
+            .insert("handoff_causation_id".to_string(), causation_id.to_string());
+    }
+}
+
+fn annotate_incoming_management_to_operation(
+    task: &mut TaskPacket,
+    incoming: &MessageEnvelope,
+    controller_node_id: &NodeId,
+) {
+    task.metadata.insert(
+        "management_kind".to_string(),
+        "management_to_operation".to_string(),
+    );
+    task.metadata.insert(
+        "management_channel".to_string(),
+        "ManagementToOperation".to_string(),
+    );
+    task.metadata.insert(
+        "management_via_controller_node_id".to_string(),
+        controller_node_id.to_string(),
+    );
+    task.metadata.insert(
+        "management_envelope_id".to_string(),
+        incoming.id.to_string(),
+    );
+    if let Some(source_node_id) = &incoming.source_node_id {
+        task.metadata.insert(
+            "management_source_node_id".to_string(),
+            source_node_id.to_string(),
+        );
+    }
+    if let Some(correlation_id) = &incoming.correlation_id {
+        task.metadata.insert(
+            "management_correlation_id".to_string(),
+            correlation_id.clone(),
+        );
+    }
+    if let Some(causation_id) = &incoming.causation_id {
+        task.metadata.insert(
+            "management_causation_id".to_string(),
+            causation_id.to_string(),
+        );
+    }
+}
+
+fn annotate_outbound_task_channel(task: &mut TaskPacket, child_id: &NodeId) {
+    if task.metadata.get("handoff_kind").map(String::as_str) == Some("operation_to_operation") {
+        task.metadata
+            .insert("handoff_target_node_id".to_string(), child_id.to_string());
+    }
+    if task.metadata.get("management_kind").map(String::as_str) == Some("management_to_operation") {
+        task.metadata.insert(
+            "management_target_node_id".to_string(),
+            child_id.to_string(),
+        );
+    }
+}
+
+fn copy_channel_metadata_to_envelope(task: &TaskPacket, envelope: &mut MessageEnvelope) {
+    for key in HANDOFF_METADATA_KEYS {
+        if let Some(value) = task.metadata.get(*key) {
+            envelope.metadata.insert((*key).to_string(), value.clone());
+        }
+    }
+    for key in MANAGEMENT_METADATA_KEYS {
+        if let Some(value) = task.metadata.get(*key) {
+            envelope.metadata.insert((*key).to_string(), value.clone());
+        }
+    }
+}
+
+fn elevate_priority(base: ChannelPriority, minimum: ChannelPriority) -> ChannelPriority {
+    if priority_rank(&base) >= priority_rank(&minimum) {
+        base
+    } else {
+        minimum
+    }
+}
+
+fn priority_rank(priority: &ChannelPriority) -> u8 {
+    match priority {
+        ChannelPriority::Low => 0,
+        ChannelPriority::Normal => 1,
+        ChannelPriority::High => 2,
+        ChannelPriority::Critical => 3,
+        ChannelPriority::Interrupt => 4,
+    }
+}
+
+fn routed_envelope_metadata(
+    reason: &str,
+    incoming: Option<&MessageEnvelope>,
+    outbound_channel: &VsmChannelType,
+) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     metadata.insert("routing_reason".to_string(), reason.to_string());
+    metadata.insert(
+        "vsm_outbound_channel".to_string(),
+        format!("{:?}", outbound_channel),
+    );
+    if let Some(incoming) = incoming {
+        metadata.insert(
+            "vsm_source_channel".to_string(),
+            format!("{:?}", incoming.channel_type),
+        );
+        metadata.insert(
+            "source_payload_type".to_string(),
+            incoming.payload_type.clone(),
+        );
+    }
     metadata
 }
 
@@ -1424,6 +2461,18 @@ mod tests {
         let ledger: Arc<dyn Ledger> = ledger;
         let controller = ControllerRuntime::new(root_id, shared_genome.clone(), transport, ledger);
         (controller, shared_genome)
+    }
+
+    #[test]
+    fn controller_default_subscribes_to_environment_channels() {
+        let config = ControllerConfig::default();
+        for channel in [
+            VsmChannelType::OperationToEnvironment,
+            VsmChannelType::FutureProbeToEnvironment,
+            VsmChannelType::EnvironmentToEnvironment,
+        ] {
+            assert!(config.subscription_channels.contains(&channel));
+        }
     }
 
     #[tokio::test]
@@ -1508,6 +2557,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operation_environment_signal_records_system1_environment_event() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let child_id = genome
+            .get_node(&root_id)
+            .expect("root")
+            .children
+            .first()
+            .cloned()
+            .expect("child");
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+        let task_id = TaskId::new();
+        let mut signal = EnvironmentSignal::new(
+            vsm_core::EnvironmentSignalKind::UserFeedback,
+            "user",
+            "User reports the generated patch fixed the original issue.",
+        );
+        signal.observed_by_node_id = Some(child_id.clone());
+        signal.target_node_id = Some(child_id.clone());
+        signal.related_task_id = Some(task_id.clone());
+        signal.severity = Some(2);
+        signal.evidence.push("feedback=positive".to_string());
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::OperationToEnvironment,
+            BuiltinPayloadType::EnvironmentSignal.as_str(),
+            &signal,
+        )
+        .expect("environment signal envelope")
+        .with_route(Some(child_id.clone()), Some(root_id.clone()));
+
+        let outcome = controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle environment signal");
+        assert!(matches!(outcome, ControllerHandleOutcome::Ignored));
+
+        let events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::Other(
+                    "operation_environment_signal".to_string(),
+                )],
+                task_id: Some(task_id),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("environment events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].metadata.get("source_channel").map(String::as_str),
+            Some("OperationToEnvironment")
+        );
+        assert_eq!(events[0].payload["kind"].as_str(), Some("UserFeedback"));
+        assert_eq!(
+            events[0].payload["observed_by_node_id"].as_str(),
+            Some(child_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn future_probe_environment_signal_records_system4_event() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let system4_id = NodeId::new();
+        let suggestion_id = vsm_core::SuggestionId::new();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+        let mut signal = EnvironmentSignal::new(
+            vsm_core::EnvironmentSignalKind::Opportunity,
+            "crate-index",
+            "A new model-provider adapter version may simplify worker integration.",
+        );
+        signal.observed_by_node_id = Some(system4_id.clone());
+        signal.target_node_id = Some(root_id.clone());
+        signal.related_suggestion_id = Some(suggestion_id.clone());
+        signal.severity = Some(4);
+        signal
+            .metadata
+            .insert("forecast_horizon".to_string(), "next_epoch".to_string());
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::FutureProbeToEnvironment,
+            BuiltinPayloadType::EnvironmentSignal.as_str(),
+            &signal,
+        )
+        .expect("future probe envelope")
+        .with_route(Some(system4_id.clone()), Some(root_id.clone()));
+
+        controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle future probe signal");
+
+        let events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::Other(
+                    "future_probe_environment_signal".to_string(),
+                )],
+                node_id: Some(root_id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("future probe events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].suggestion_id, Some(suggestion_id));
+        assert_eq!(
+            events[0].metadata.get("source_channel").map(String::as_str),
+            Some("FutureProbeToEnvironment")
+        );
+        assert_eq!(events[0].payload["kind"].as_str(), Some("Opportunity"));
+        assert_eq!(
+            events[0].payload["metadata"]["forecast_horizon"].as_str(),
+            Some("next_epoch")
+        );
+    }
+
+    #[tokio::test]
+    async fn environment_interaction_signal_records_environment_to_environment_event() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+        let mut signal = EnvironmentSignal::new(
+            vsm_core::EnvironmentSignalKind::Risk,
+            "package-registry",
+            "CI images and the package registry are disagreeing on dependency availability.",
+        );
+        signal.target_environment = Some("ci".to_string());
+        signal.target_node_id = Some(root_id.clone());
+        signal.severity = Some(8);
+        signal
+            .evidence
+            .push("registry=crate_missing ci=build_blocked".to_string());
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::EnvironmentToEnvironment,
+            BuiltinPayloadType::EnvironmentSignal.as_str(),
+            &signal,
+        )
+        .expect("environment interaction envelope")
+        .with_route(None, Some(root_id.clone()));
+
+        controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle environment interaction");
+
+        let events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::Other(
+                    "environment_interaction_signal".to_string(),
+                )],
+                node_id: Some(root_id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("environment interaction events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].metadata.get("source_channel").map(String::as_str),
+            Some("EnvironmentToEnvironment")
+        );
+        assert_eq!(events[0].payload["kind"].as_str(), Some("Risk"));
+        assert_eq!(events[0].payload["severity"].as_u64(), Some(8));
+        assert_eq!(events[0].payload["target_environment"].as_str(), Some("ci"));
+    }
+
+    #[tokio::test]
     async fn task_packet_lineage_is_recorded_from_channel_traffic() {
         let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
         let root_id = genome.root_node_id.clone();
@@ -1584,6 +2802,990 @@ mod tests {
         assert_eq!(
             routed[0].payload["source_channel"].as_str(),
             Some("ResourceBargaining")
+        );
+    }
+
+    #[tokio::test]
+    async fn command_channel_routes_non_negotiable_task_on_command_channel() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let child_id = genome
+            .get_node(&root_id)
+            .expect("root")
+            .children
+            .first()
+            .cloned()
+            .expect("child");
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut child_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![VsmChannelType::Command],
+                target_node_id: Some(child_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe child");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+        let command = vsm_core::Command {
+            issued_by: root_id.clone(),
+            target: child_id.clone(),
+            title: "Freeze unsafe deployment".to_string(),
+            body: "Do not deploy this build until the policy review passes.".to_string(),
+            non_negotiable: true,
+            legal_or_policy_basis: Some("release-policy".to_string()),
+        };
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::Command,
+            BuiltinPayloadType::Command.as_str(),
+            &command,
+        )
+        .expect("command envelope")
+        .with_route(Some(root_id.clone()), Some(root_id.clone()));
+
+        let outcome = controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle command");
+        let ControllerHandleOutcome::RoutedTask {
+            task,
+            child_id: routed_child,
+            ..
+        } = outcome
+        else {
+            panic!("expected routed command task");
+        };
+        assert_eq!(routed_child, child_id);
+        assert_eq!(task.assigned_to, Some(child_id.clone()));
+        assert_eq!(
+            task.metadata
+                .get("command_non_negotiable")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
+                .await
+                .expect("published command task")
+                .expect("stream item")
+                .expect("published envelope");
+        assert_eq!(published.channel_type, VsmChannelType::Command);
+        assert_eq!(published.priority, ChannelPriority::Critical);
+        assert_eq!(
+            published
+                .metadata
+                .get("vsm_outbound_channel")
+                .map(String::as_str),
+            Some("Command")
+        );
+        let published_task: TaskPacket = published.payload_as().expect("published task");
+        assert_eq!(published_task.id, task.id);
+
+        let routed = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskRouted],
+                task_id: Some(task.id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("routed events");
+        assert_eq!(routed.len(), 1);
+        assert_eq!(
+            routed[0].payload["source_channel"].as_str(),
+            Some("Command")
+        );
+        assert_eq!(
+            routed[0].payload["outbound_channel"].as_str(),
+            Some("Command")
+        );
+        assert_eq!(
+            routed[0].payload["channel_priority"].as_str(),
+            Some("Critical")
+        );
+
+        let mapped = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskMapped],
+                task_id: Some(task.id),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("mapped events");
+        assert_eq!(
+            mapped[0].payload["decomposition_policy"].as_str(),
+            Some("system3_command_channel")
+        );
+    }
+
+    #[tokio::test]
+    async fn system2_coordination_tasks_preserve_coordination_channel() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let child_id = genome
+            .get_node(&root_id)
+            .expect("root")
+            .children
+            .first()
+            .cloned()
+            .expect("child");
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut child_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![VsmChannelType::System2Coordination],
+                target_node_id: Some(child_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe child");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+        let mut task = TaskPacket::new("Coordinate handoff", "dampen duplicated handoff work");
+        task.metadata
+            .insert("requires_code_write".to_string(), "true".to_string());
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::System2Coordination,
+            BuiltinPayloadType::TaskPacket.as_str(),
+            &task,
+        )
+        .expect("coordination envelope")
+        .with_route(None, Some(root_id.clone()));
+
+        controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle coordination task");
+
+        let published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
+                .await
+                .expect("published coordination task")
+                .expect("stream item")
+                .expect("published envelope");
+        assert_eq!(published.channel_type, VsmChannelType::System2Coordination);
+        assert_eq!(published.priority, ChannelPriority::High);
+        assert_eq!(
+            published
+                .metadata
+                .get("vsm_source_channel")
+                .map(String::as_str),
+            Some("System2Coordination")
+        );
+
+        let routed = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskRouted],
+                task_id: Some(task.id),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("routed events");
+        assert_eq!(
+            routed[0].payload["source_channel"].as_str(),
+            Some("System2Coordination")
+        );
+        assert_eq!(
+            routed[0].payload["outbound_channel"].as_str(),
+            Some("System2Coordination")
+        );
+        assert_eq!(routed[0].payload["channel_priority"].as_str(), Some("High"));
+    }
+
+    #[tokio::test]
+    async fn management_to_operation_preserves_management_channel_and_lineage() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let child_id = genome
+            .get_node(&root_id)
+            .expect("root")
+            .children
+            .first()
+            .cloned()
+            .expect("child");
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut child_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![VsmChannelType::ManagementToOperation],
+                target_node_id: Some(child_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe child");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+
+        let mut task = TaskPacket::new("Apply local management decision", "execute managed work");
+        task.metadata
+            .insert("requires_code_write".to_string(), "true".to_string());
+        let mut envelope = MessageEnvelope::new(
+            VsmChannelType::ManagementToOperation,
+            BuiltinPayloadType::TaskPacket.as_str(),
+            &task,
+        )
+        .expect("management envelope")
+        .with_route(Some(root_id.clone()), Some(root_id.clone()));
+        envelope.correlation_id = Some("management-correlation".to_string());
+
+        let outcome = controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle management task");
+        let ControllerHandleOutcome::RoutedTask {
+            task: routed_task,
+            child_id: routed_child,
+            ..
+        } = outcome
+        else {
+            panic!("expected routed task");
+        };
+        assert_eq!(routed_child, child_id);
+        assert_eq!(
+            routed_task
+                .metadata
+                .get("management_kind")
+                .map(String::as_str),
+            Some("management_to_operation")
+        );
+        assert_eq!(
+            routed_task
+                .metadata
+                .get("management_source_node_id")
+                .map(String::as_str),
+            Some(root_id.as_str())
+        );
+
+        let published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
+                .await
+                .expect("published management task")
+                .expect("stream item")
+                .expect("published envelope");
+        assert_eq!(
+            published.channel_type,
+            VsmChannelType::ManagementToOperation
+        );
+        assert_eq!(published.target_node_id, Some(child_id.clone()));
+        assert_eq!(
+            published
+                .metadata
+                .get("management_kind")
+                .map(String::as_str),
+            Some("management_to_operation")
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("management_source_node_id")
+                .map(String::as_str),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("management_target_node_id")
+                .map(String::as_str),
+            Some(child_id.as_str())
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("management_via_controller_node_id")
+                .map(String::as_str),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("vsm_source_channel")
+                .map(String::as_str),
+            Some("ManagementToOperation")
+        );
+        let published_task: TaskPacket = published.payload_as().expect("published task");
+        assert_eq!(published_task.assigned_to, Some(child_id.clone()));
+        assert_eq!(
+            published_task
+                .metadata
+                .get("management_target_node_id")
+                .map(String::as_str),
+            Some(child_id.as_str())
+        );
+
+        let routed = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskRouted],
+                task_id: Some(task.id),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("routed events");
+        assert_eq!(routed.len(), 1);
+        assert_eq!(
+            routed[0].payload["source_channel"].as_str(),
+            Some("ManagementToOperation")
+        );
+        assert_eq!(
+            routed[0].payload["outbound_channel"].as_str(),
+            Some("ManagementToOperation")
+        );
+        assert_eq!(
+            routed[0].payload["management_kind"].as_str(),
+            Some("management_to_operation")
+        );
+        assert_eq!(
+            routed[0].payload["management_source_node_id"].as_str(),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            routed[0].payload["management_target_node_id"].as_str(),
+            Some(child_id.as_str())
+        );
+        assert_eq!(
+            routed[0].payload["management_correlation_id"].as_str(),
+            Some("management-correlation")
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_to_operation_handoff_preserves_peer_channel_and_lineage() {
+        let root = ViableNode::new_metasystem("root");
+        let root_id = root.id.clone();
+        let mut genome = OrganizationalGenome::new(root);
+        let coder = ViableNode::new_leaf("coder", LeafOperationSpec::coding());
+        let coder_id = coder.id.clone();
+        let reviewer = ViableNode::new_leaf("reviewer", LeafOperationSpec::reviewer());
+        let reviewer_id = reviewer.id.clone();
+        genome.add_child(&root_id, coder).expect("coder child");
+        genome
+            .add_child(&root_id, reviewer)
+            .expect("reviewer child");
+
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut reviewer_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![VsmChannelType::OperationToOperation],
+                target_node_id: Some(reviewer_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe reviewer");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+
+        let mut task = TaskPacket::new("Review peer handoff", "continue peer work-in-progress");
+        task.metadata
+            .insert("target_child".to_string(), "reviewer".to_string());
+        task.metadata
+            .insert("required_capability".to_string(), "review".to_string());
+        let mut envelope = MessageEnvelope::new(
+            VsmChannelType::OperationToOperation,
+            BuiltinPayloadType::TaskPacket.as_str(),
+            &task,
+        )
+        .expect("handoff envelope")
+        .with_route(Some(coder_id.clone()), Some(root_id.clone()));
+        envelope.correlation_id = Some("peer-handoff-correlation".to_string());
+
+        let outcome = controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle handoff task");
+        let ControllerHandleOutcome::RoutedTask {
+            task: routed_task,
+            child_id,
+            ..
+        } = outcome
+        else {
+            panic!("expected routed task");
+        };
+        assert_eq!(child_id, reviewer_id);
+        assert_eq!(
+            routed_task.metadata.get("handoff_kind").map(String::as_str),
+            Some("operation_to_operation")
+        );
+        assert_eq!(
+            routed_task
+                .metadata
+                .get("handoff_source_node_id")
+                .map(String::as_str),
+            Some(coder_id.as_str())
+        );
+
+        let published = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            reviewer_stream.next(),
+        )
+        .await
+        .expect("published handoff task")
+        .expect("stream item")
+        .expect("published envelope");
+        assert_eq!(published.channel_type, VsmChannelType::OperationToOperation);
+        assert_eq!(published.target_node_id, Some(reviewer_id.clone()));
+        assert_eq!(
+            published.metadata.get("handoff_kind").map(String::as_str),
+            Some("operation_to_operation")
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("handoff_source_node_id")
+                .map(String::as_str),
+            Some(coder_id.as_str())
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("handoff_target_node_id")
+                .map(String::as_str),
+            Some(reviewer_id.as_str())
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("handoff_via_controller_node_id")
+                .map(String::as_str),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("vsm_source_channel")
+                .map(String::as_str),
+            Some("OperationToOperation")
+        );
+        let published_task: TaskPacket = published.payload_as().expect("published task");
+        assert_eq!(published_task.assigned_to, Some(reviewer_id.clone()));
+        assert_eq!(
+            published_task
+                .metadata
+                .get("handoff_target_node_id")
+                .map(String::as_str),
+            Some(reviewer_id.as_str())
+        );
+
+        let routed = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskRouted],
+                task_id: Some(task.id),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("routed events");
+        assert_eq!(routed.len(), 1);
+        assert_eq!(
+            routed[0].payload["source_channel"].as_str(),
+            Some("OperationToOperation")
+        );
+        assert_eq!(
+            routed[0].payload["outbound_channel"].as_str(),
+            Some("OperationToOperation")
+        );
+        assert_eq!(
+            routed[0].payload["handoff_kind"].as_str(),
+            Some("operation_to_operation")
+        );
+        assert_eq!(
+            routed[0].payload["handoff_source_node_id"].as_str(),
+            Some(coder_id.as_str())
+        );
+        assert_eq!(
+            routed[0].payload["handoff_target_node_id"].as_str(),
+            Some(reviewer_id.as_str())
+        );
+        assert_eq!(
+            routed[0].payload["handoff_correlation_id"].as_str(),
+            Some("peer-handoff-correlation")
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_bargain_publishes_policy_bounded_allocation_decision() {
+        let (mut genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let child_id = genome
+            .get_node(&root_id)
+            .expect("root")
+            .children
+            .first()
+            .cloned()
+            .expect("child");
+        genome
+            .get_node_mut(&root_id)
+            .expect("root mut")
+            .system_3
+            .default_task_budget_tokens = Some(1_000);
+        let child = genome.get_node_mut(&child_id).expect("child mut");
+        child
+            .permissions
+            .allowed_tools
+            .push("read_filesystem".to_string());
+        child.permissions.denied_tools.push("network".to_string());
+        child
+            .context_policy
+            .retrievable_context_refs
+            .push("repo://src".to_string());
+
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut child_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![VsmChannelType::ResourceBargaining],
+                target_node_id: Some(child_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe child");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+        let bargain = ResourceBargain {
+            requested_by: child_id.clone(),
+            task_id: Some(TaskId::new()),
+            requested_tokens: Some(1_500),
+            requested_tool_permissions: vec!["read_filesystem".to_string(), "network".to_string()],
+            requested_context_refs: vec!["repo://src".to_string(), "secret://prod".to_string()],
+            justification: "Need bounded resources for implementation task".to_string(),
+        };
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::ResourceBargaining,
+            BuiltinPayloadType::ResourceBargain.as_str(),
+            &bargain,
+        )
+        .expect("resource bargain envelope")
+        .with_route(Some(child_id.clone()), Some(root_id.clone()));
+
+        let outcome = controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle resource bargain");
+        assert!(matches!(outcome, ControllerHandleOutcome::Ignored));
+
+        let published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
+                .await
+                .expect("published allocation decision")
+                .expect("stream item")
+                .expect("published envelope");
+        assert_eq!(published.channel_type, VsmChannelType::ResourceBargaining);
+        assert_eq!(
+            published.payload_type,
+            BuiltinPayloadType::ResourceAllocationDecision.as_str()
+        );
+        assert_eq!(published.priority, ChannelPriority::High);
+        let decision: ResourceAllocationDecision =
+            published.payload_as().expect("allocation decision");
+        assert_eq!(decision.requested_by, child_id);
+        assert_eq!(decision.status, ResourceAllocationStatus::PartiallyApproved);
+        assert_eq!(decision.approved_tokens, Some(1_000));
+        assert_eq!(
+            decision.approved_tool_permissions,
+            vec!["read_filesystem".to_string()]
+        );
+        assert_eq!(
+            decision.denied_tool_permissions,
+            vec!["network".to_string()]
+        );
+        assert_eq!(
+            decision.approved_context_refs,
+            vec!["repo://src".to_string()]
+        );
+        assert_eq!(
+            decision.denied_context_refs,
+            vec!["secret://prod".to_string()]
+        );
+
+        let allocation_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::Other(
+                    "resource_allocation_decision".to_string(),
+                )],
+                task_id: bargain.task_id.clone(),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("allocation events");
+        assert_eq!(allocation_events.len(), 1);
+        assert_eq!(
+            allocation_events[0]
+                .metadata
+                .get("allocation_status")
+                .map(String::as_str),
+            Some("PartiallyApproved")
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_bargain_respects_system3_allocation_switch() {
+        let (mut genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let child_id = genome
+            .get_node(&root_id)
+            .expect("root")
+            .children
+            .first()
+            .cloned()
+            .expect("child");
+        genome
+            .get_node_mut(&root_id)
+            .expect("root mut")
+            .system_3
+            .can_allocate_budget = false;
+
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut child_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![VsmChannelType::ResourceBargaining],
+                target_node_id: Some(child_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe child");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+        let bargain = ResourceBargain {
+            requested_by: child_id,
+            task_id: Some(TaskId::new()),
+            requested_tokens: Some(500),
+            requested_tool_permissions: vec![],
+            requested_context_refs: vec![],
+            justification: "Need task budget".to_string(),
+        };
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::ResourceBargaining,
+            BuiltinPayloadType::ResourceBargain.as_str(),
+            &bargain,
+        )
+        .expect("resource bargain envelope")
+        .with_route(None, Some(root_id));
+
+        controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle resource bargain");
+
+        let published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
+                .await
+                .expect("published allocation decision")
+                .expect("stream item")
+                .expect("published envelope");
+        let decision: ResourceAllocationDecision =
+            published.payload_as().expect("allocation decision");
+        assert_eq!(decision.status, ResourceAllocationStatus::Denied);
+        assert_eq!(decision.approved_tokens, None);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("disabled by genome policy")));
+    }
+
+    #[tokio::test]
+    async fn audit_report_channel_creates_suggestion_and_queued_candidate() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, shared_genome) = controller_for(genome, ledger.clone());
+
+        let audit_node_id = NodeId::new();
+        let reviewer = ViableNode::new_leaf("audit-reviewer", LeafOperationSpec::reviewer());
+        let reviewer_id = reviewer.id.clone();
+        let report = vsm_core::AuditReport {
+            target_node_id: root_id.clone(),
+            findings: vec![vsm_core::AuditFinding {
+                title: "Review bottleneck observed".to_string(),
+                evidence: vec!["failed review handoff ratio exceeded threshold".to_string()],
+                severity: 7,
+                related_nodes: vec![root_id.clone()],
+                related_tasks: vec![],
+            }],
+            suggested_patches: vec![OrganizationalGenomePatch::AddChild {
+                parent_id: root_id.clone(),
+                child: reviewer,
+            }],
+        };
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::Audit,
+            BuiltinPayloadType::AuditReport.as_str(),
+            &report,
+        )
+        .expect("audit report envelope")
+        .with_route(Some(audit_node_id.clone()), Some(root_id.clone()));
+
+        let outcome = controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle audit report");
+        assert!(matches!(outcome, ControllerHandleOutcome::Ignored));
+        assert!(!shared_genome.read().await.nodes.contains_key(&reviewer_id));
+
+        let audit_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::AuditCompleted],
+                node_id: Some(root_id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("audit events");
+        assert_eq!(audit_events.len(), 1);
+        assert_eq!(
+            audit_events[0]
+                .metadata
+                .get("source_channel")
+                .map(String::as_str),
+            Some("Audit")
+        );
+        assert_eq!(
+            audit_events[0]
+                .metadata
+                .get("suggestion_count")
+                .map(String::as_str),
+            Some("1")
+        );
+
+        let suggestion_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::GeneSuggestionCreated],
+                node_id: Some(root_id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("suggestion events");
+        assert_eq!(suggestion_events.len(), 1);
+        assert_eq!(
+            suggestion_events[0]
+                .metadata
+                .get("source_channel")
+                .map(String::as_str),
+            Some("Audit")
+        );
+
+        let queued = ledger
+            .queued_trial_records(&root_id, 10)
+            .await
+            .expect("queued trials");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].suggestion.source,
+            GeneSuggestionSource::System3StarAudit
+        );
+        assert_eq!(queued[0].suggestion.suggested_by_node_id, audit_node_id);
+        assert!(queued[0].suggestion.safety_limits.requires_approval);
+        assert!(queued[0]
+            .suggestion
+            .evidence
+            .iter()
+            .any(|evidence| evidence.contains("Review bottleneck observed")));
+    }
+
+    #[tokio::test]
+    async fn three_four_homeostat_gene_suggestion_is_queued_not_applied() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let system4_id = NodeId::new();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, shared_genome) = controller_for(genome, ledger.clone());
+
+        let future_probe_leaf =
+            ViableNode::new_leaf("future-probe-reviewer", LeafOperationSpec::reviewer());
+        let future_probe_leaf_id = future_probe_leaf.id.clone();
+        let mut suggestion = GeneSuggestion::new(
+            system4_id.clone(),
+            root_id.clone(),
+            GeneSuggestionSource::System4FutureProbe,
+            OrganizationalGenomePatch::AddChild {
+                parent_id: root_id.clone(),
+                child: future_probe_leaf,
+            },
+            "Future probe predicts review capacity pressure.",
+        );
+        suggestion
+            .evidence
+            .push("forecast=review_queue_growth".to_string());
+        let suggestion_id = suggestion.id.clone();
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::ThreeFourHomeostat,
+            BuiltinPayloadType::GeneSuggestion.as_str(),
+            &suggestion,
+        )
+        .expect("gene suggestion envelope")
+        .with_route(Some(system4_id.clone()), Some(root_id.clone()));
+
+        let outcome = controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle gene suggestion");
+        assert!(matches!(outcome, ControllerHandleOutcome::Ignored));
+        assert!(!shared_genome
+            .read()
+            .await
+            .nodes
+            .contains_key(&future_probe_leaf_id));
+
+        let suggestion_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::GeneSuggestionCreated],
+                node_id: Some(root_id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("suggestion events");
+        assert_eq!(suggestion_events.len(), 1);
+        assert_eq!(
+            suggestion_events[0].suggestion_id,
+            Some(suggestion_id.clone())
+        );
+        assert_eq!(
+            suggestion_events[0]
+                .metadata
+                .get("source_channel")
+                .map(String::as_str),
+            Some("ThreeFourHomeostat")
+        );
+
+        let queued = ledger
+            .queued_trial_records(&root_id, 10)
+            .await
+            .expect("queued trials");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].trial_id, suggestion_id);
+        assert_eq!(
+            queued[0].suggestion.source,
+            GeneSuggestionSource::System4FutureProbe
+        );
+        assert!(queued[0]
+            .suggestion
+            .evidence
+            .iter()
+            .any(|evidence| evidence == "source_channel=ThreeFourHomeostat"));
+    }
+
+    #[tokio::test]
+    async fn algedonic_freeze_rejects_related_queued_mutation() {
+        let (genome, suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let suggestion_id = suggestion.id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+        controller
+            .queue_candidate_from_suggestion(suggestion)
+            .await
+            .expect("queue candidate");
+
+        let mut signal = vsm_core::AlgedonicSignal::pain(
+            vsm_core::AlgedonicSource::Ci,
+            9,
+            "candidate caused a severe CI failure",
+        );
+        signal.target_node_id = Some(root_id.clone());
+        signal.related_suggestion_id = Some(suggestion_id.clone());
+        signal.override_policy = Some(vsm_core::AlgedonicOverridePolicy {
+            freeze_mutation: true,
+            require_human_confirmation: true,
+            ..vsm_core::AlgedonicOverridePolicy::default()
+        });
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::Algedonic,
+            BuiltinPayloadType::AlgedonicSignal.as_str(),
+            &signal,
+        )
+        .expect("algedonic envelope")
+        .with_route(None, Some(root_id.clone()));
+
+        let outcome = controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle algedonic signal");
+        assert!(matches!(outcome, ControllerHandleOutcome::Ignored));
+
+        let record = ledger
+            .get_trial_record(&suggestion_id)
+            .await
+            .expect("trial record")
+            .expect("queued record");
+        assert_eq!(record.status, StoredTrialStatus::Rejected);
+        assert!(record
+            .metadata
+            .get("rejection_reason")
+            .is_some_and(|reason| reason.contains("algedonic freeze_mutation")));
+
+        let override_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::Other(
+                    "algedonic_override_applied".to_string(),
+                )],
+                node_id: Some(root_id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("override events");
+        assert_eq!(override_events.len(), 1);
+        assert_eq!(
+            override_events[0].payload["actions"][0].as_str(),
+            Some("freeze_mutation")
+        );
+
+        let rejected_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TrialRejected],
+                node_id: Some(root_id),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("rejected events");
+        assert_eq!(rejected_events.len(), 1);
+        assert_eq!(
+            rejected_events[0].payload["reason"].as_str(),
+            Some("algedonic freeze_mutation")
         );
     }
 
