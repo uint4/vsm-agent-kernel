@@ -153,6 +153,58 @@ impl Ledger for InMemoryLedger {
             })
             .cloned())
     }
+
+    async fn queued_trial_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<StoredTrialRecord>, LedgerError> {
+        let mut records: Vec<StoredTrialRecord> = self
+            .trials
+            .lock()
+            .await
+            .values()
+            .filter(|record| {
+                &record.controller_node_id == controller_node_id
+                    && record.status == crate::StoredTrialStatus::Queued
+            })
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+        if limit > 0 && records.len() > limit {
+            records.truncate(limit);
+        }
+        Ok(records)
+    }
+
+    async fn completed_trial_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<StoredTrialRecord>, LedgerError> {
+        let mut records: Vec<StoredTrialRecord> = self
+            .trials
+            .lock()
+            .await
+            .values()
+            .filter(|record| {
+                &record.controller_node_id == controller_node_id
+                    && matches!(
+                        record.status,
+                        crate::StoredTrialStatus::Promoted
+                            | crate::StoredTrialStatus::Pruned
+                            | crate::StoredTrialStatus::Rejected
+                            | crate::StoredTrialStatus::Archived
+                    )
+            })
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        if limit > 0 && records.len() > limit {
+            records.truncate(limit);
+        }
+        Ok(records)
+    }
 }
 
 fn filter_event(event: &LedgerEvent, filter: &EventFilter) -> bool {

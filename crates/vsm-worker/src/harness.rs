@@ -187,6 +187,7 @@ impl WorkerHarness {
         };
 
         copy_trial_metadata(&task, &mut result, &mut trace);
+        copy_replay_metadata(&task, &mut trace);
 
         if let Some(usage) = usage {
             trace.input_tokens = usage.input_tokens;
@@ -260,7 +261,16 @@ fn harvest_provider_artifacts(raw: &Option<serde_json::Value>, result: &mut Task
 }
 
 fn copy_trial_metadata(task: &TaskPacket, result: &mut TaskResult, trace: &mut TaskTrace) {
-    for key in ["trial_id", "related_suggestion_id", "candidate_genome_id"] {
+    for key in [
+        "trial_id",
+        "related_suggestion_id",
+        "candidate_genome_id",
+        "trial_mode",
+        "trial_route_role",
+        "trial_shadow",
+        "trial_exposure_basis_points",
+        "trial_exposure_bucket",
+    ] {
         if let Some(value) = task.metadata.get(key) {
             result.metadata.insert(key.to_string(), value.clone());
             trace.metadata.insert(key.to_string(), value.clone());
@@ -280,6 +290,48 @@ fn copy_trial_metadata(task: &TaskPacket, result: &mut TaskResult, trace: &mut T
         {
             trace.related_suggestion_ids.push(suggestion_id);
         }
+    }
+}
+
+fn copy_replay_metadata(task: &TaskPacket, trace: &mut TaskTrace) {
+    trace
+        .metadata
+        .insert("task_title".to_string(), task.title.clone());
+    trace
+        .metadata
+        .insert("task_goal".to_string(), task.goal.clone());
+    trace
+        .metadata
+        .insert("task_risk".to_string(), format!("{:?}", task.risk));
+
+    if !task.scope.is_empty() {
+        trace
+            .metadata
+            .insert("task_scope".to_string(), task.scope.join("\n"));
+    }
+    if !task.static_predicates.languages.is_empty() {
+        trace.metadata.insert(
+            "task_languages".to_string(),
+            task.static_predicates.languages.join(","),
+        );
+    }
+    if !task.static_predicates.modules.is_empty() {
+        trace.metadata.insert(
+            "task_modules".to_string(),
+            task.static_predicates.modules.join(","),
+        );
+    }
+    if !task.static_predicates.tags.is_empty() {
+        trace.metadata.insert(
+            "task_tags".to_string(),
+            task.static_predicates.tags.join(","),
+        );
+    }
+
+    for (key, value) in &task.metadata {
+        trace
+            .metadata
+            .insert(format!("task_metadata.{key}"), value.clone());
     }
 }
 
@@ -339,7 +391,7 @@ fn require_capability(
 mod tests {
     use vsm_core::{GenomeId, NodeId, SuggestionId, TaskId, TaskPacket, TaskResult, TaskTrace};
 
-    use super::copy_trial_metadata;
+    use super::{copy_replay_metadata, copy_trial_metadata};
 
     #[test]
     fn trial_metadata_is_copied_to_result_and_trace() {
@@ -357,6 +409,16 @@ mod tests {
             "candidate_genome_id".to_string(),
             candidate_genome_id.to_string(),
         );
+        task.metadata
+            .insert("trial_mode".to_string(), "canary".to_string());
+        task.metadata
+            .insert("trial_route_role".to_string(), "shadow".to_string());
+        task.metadata
+            .insert("trial_shadow".to_string(), "true".to_string());
+        task.metadata
+            .insert("trial_exposure_basis_points".to_string(), "250".to_string());
+        task.metadata
+            .insert("trial_exposure_bucket".to_string(), "42".to_string());
 
         let mut result = TaskResult::completed(TaskId::new(), node_id.clone(), "ok");
         let mut trace = TaskTrace::started(TaskId::new(), candidate_genome_id.clone(), node_id);
@@ -378,5 +440,68 @@ mod tests {
             .related_suggestion_ids
             .iter()
             .any(|related| related == &suggestion_id));
+        assert_eq!(
+            result.metadata.get("trial_mode").map(String::as_str),
+            Some("canary")
+        );
+        assert_eq!(
+            result.metadata.get("trial_route_role").map(String::as_str),
+            Some("shadow")
+        );
+        assert_eq!(
+            trace.metadata.get("trial_shadow").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            trace
+                .metadata
+                .get("trial_exposure_basis_points")
+                .map(String::as_str),
+            Some("250")
+        );
+        assert_eq!(
+            trace
+                .metadata
+                .get("trial_exposure_bucket")
+                .map(String::as_str),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn replay_metadata_preserves_task_shape_on_trace() {
+        let genome_id = GenomeId::new();
+        let node_id = NodeId::new();
+        let mut task = TaskPacket::new("Review change", "review a risky patch");
+        task.risk = vsm_core::RiskClass::High;
+        task.scope.push("crates/example/src/lib.rs".to_string());
+        task.static_predicates.languages.push("rust".to_string());
+        task.static_predicates.modules.push("example".to_string());
+        task.static_predicates.tags.push("review".to_string());
+        task.metadata
+            .insert("required_capability".to_string(), "review".to_string());
+        let mut trace = TaskTrace::started(TaskId::new(), genome_id, node_id);
+
+        copy_replay_metadata(&task, &mut trace);
+
+        assert_eq!(
+            trace.metadata.get("task_title").map(String::as_str),
+            Some("Review change")
+        );
+        assert_eq!(
+            trace.metadata.get("task_risk").map(String::as_str),
+            Some("High")
+        );
+        assert_eq!(
+            trace.metadata.get("task_languages").map(String::as_str),
+            Some("rust")
+        );
+        assert_eq!(
+            trace
+                .metadata
+                .get("task_metadata.required_capability")
+                .map(String::as_str),
+            Some("review")
+        );
     }
 }

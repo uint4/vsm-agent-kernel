@@ -1,6 +1,8 @@
 use crate::{
-    tag_task_for_trial, trial_decision_key, ControllerError, DirectiveTaskMapper,
-    System3StarAuditor, TaskRouter, TrialManager,
+    compare_queued_candidate_evaluations, evaluate_queued_candidate_with_replay,
+    pareto_frontier_indices, replay_candidate_against_traces, tag_task_for_trial_route,
+    trial_decision_key, ControllerError, DirectiveTaskMapper, System3StarAuditor, TaskRouter,
+    TrialManager,
 };
 use futures_util::StreamExt;
 use std::{collections::BTreeMap, sync::Arc};
@@ -12,7 +14,7 @@ use vsm_core::{
 };
 use vsm_ledger::{
     EventFilter, GenomeSnapshot, GenomeSnapshotRole, Ledger, LedgerEvent, LedgerEventKind,
-    TraceWindow,
+    StoredTrialRecord, TraceWindow,
 };
 use vsm_runtime::{TrialConfig, TrialDecision, TrialEvaluation};
 
@@ -146,6 +148,235 @@ impl ControllerRuntime {
         Ok(started.candidate_genome_id)
     }
 
+    pub async fn queue_candidate_from_suggestion(
+        &self,
+        suggestion: GeneSuggestion,
+    ) -> Result<vsm_core::GenomeId, ControllerError> {
+        let champion = { self.genome.read().await.clone() };
+        let queued = {
+            let trials = self.trials.read().await;
+            trials.queue_candidate(self.node_id.clone(), &champion, suggestion.clone())?
+        };
+
+        self.ledger
+            .set_champion_genome(&self.node_id, champion.clone())
+            .await?;
+        let mut snapshot = GenomeSnapshot::new(
+            queued.candidate_genome.clone(),
+            GenomeSnapshotRole::Candidate,
+        );
+        snapshot.metadata.insert(
+            "suggestion_id".to_string(),
+            queued.suggestion_id.to_string(),
+        );
+        snapshot.metadata.insert(
+            "base_genome_id".to_string(),
+            queued.base_genome_id.to_string(),
+        );
+        self.ledger.save_genome_snapshot(snapshot).await?;
+        self.ledger
+            .write_trial_record(queued.record.clone())
+            .await?;
+
+        self.ledger
+            .append_event(
+                LedgerEvent::new(
+                    LedgerEventKind::TrialQueued,
+                    serde_json::json!({
+                        "suggestion_id": queued.suggestion_id.to_string(),
+                        "base_genome_id": queued.base_genome_id.to_string(),
+                        "candidate_genome_id": queued.candidate_genome_id.to_string(),
+                        "trial_mode": format!("{:?}", suggestion.trial_mode),
+                    }),
+                )?
+                .with_node(self.node_id.clone())
+                .with_genome(queued.candidate_genome_id.clone())
+                .with_suggestion(queued.suggestion_id),
+            )
+            .await?;
+
+        Ok(queued.candidate_genome_id)
+    }
+
+    pub async fn start_next_queued_trial(
+        &self,
+    ) -> Result<Option<vsm_core::GenomeId>, ControllerError> {
+        if let Some(active_suggestion_id) = self.trials.read().await.active_suggestion_id() {
+            return Err(ControllerError::TrialAlreadyActive(active_suggestion_id));
+        }
+        if let Some(active_record) = self.ledger.get_active_trial_record(&self.node_id).await? {
+            return Err(ControllerError::TrialAlreadyActive(active_record.trial_id));
+        }
+
+        let champion = { self.genome.read().await.clone() };
+        let champion_id = champion.id.clone();
+        let queued_records = self.ledger.queued_trial_records(&self.node_id, 50).await?;
+        let completed_history = self
+            .ledger
+            .completed_trial_records(&self.node_id, 200)
+            .await?;
+        let replay_traces = self
+            .ledger
+            .recent_task_traces(TraceWindow {
+                since: None,
+                limit: Some(200),
+            })
+            .await?;
+        let replay_weights = self.trials.read().await.fitness_weights();
+        let mut selectable = Vec::new();
+
+        for record in queued_records {
+            if record.base_genome_id != champion_id {
+                self.reject_queued_trial_record(
+                    record,
+                    format!("base genome superseded by current champion {}", champion_id),
+                )
+                .await?;
+                continue;
+            }
+
+            let Some(candidate_snapshot) = self
+                .ledger
+                .get_genome_snapshot(&record.candidate_genome_id)
+                .await?
+            else {
+                self.reject_queued_trial_record(
+                    record.clone(),
+                    format!(
+                        "candidate genome snapshot missing: {}",
+                        record.candidate_genome_id
+                    ),
+                )
+                .await?;
+                continue;
+            };
+
+            let replay = replay_candidate_against_traces(
+                &self.config.router,
+                &self.node_id,
+                &champion,
+                &candidate_snapshot.genome,
+                &record,
+                &replay_traces,
+                &replay_weights,
+            )?;
+            let evaluation =
+                evaluate_queued_candidate_with_replay(&record, &completed_history, &replay);
+            selectable.push((record, candidate_snapshot, evaluation, replay));
+        }
+
+        let evaluations = selectable
+            .iter()
+            .map(|(_, _, evaluation, _)| evaluation.clone())
+            .collect::<Vec<_>>();
+        let frontier_indices = pareto_frontier_indices(&evaluations);
+        let frontier_size = frontier_indices.len();
+        let mut frontier_index = 0;
+        selectable.retain(|_| {
+            let keep = frontier_indices.contains(&frontier_index);
+            frontier_index += 1;
+            keep
+        });
+        selectable.sort_by(|left, right| {
+            compare_queued_candidate_evaluations(
+                &(left.0.clone(), left.2.clone()),
+                &(right.0.clone(), right.2.clone()),
+            )
+        });
+
+        if let Some((mut record, candidate_snapshot, evaluation, replay)) =
+            selectable.into_iter().next()
+        {
+            record.metadata.insert(
+                "selection_policy".to_string(),
+                "pareto_empirical_candidate_score_v1".to_string(),
+            );
+            record.metadata.insert(
+                "selection_score".to_string(),
+                format!("{:.3}", evaluation.score.total_score),
+            );
+            record.metadata.insert(
+                "selection_reasons".to_string(),
+                evaluation.score.reasons.join("|"),
+            );
+            record.metadata.insert(
+                "pareto_frontier_size".to_string(),
+                frontier_size.to_string(),
+            );
+            record.metadata.insert(
+                "candidate_objectives".to_string(),
+                format_candidate_objectives(&evaluation.objectives),
+            );
+            record.metadata.insert(
+                "replay_trace_count".to_string(),
+                replay.trace_count.to_string(),
+            );
+            record.metadata.insert(
+                "replay_eligible_trace_count".to_string(),
+                replay.eligible_trace_count.to_string(),
+            );
+            record.metadata.insert(
+                "replay_candidate_route_count".to_string(),
+                replay.candidate_route_count.to_string(),
+            );
+            record.metadata.insert(
+                "replay_affected_route_count".to_string(),
+                replay.affected_route_count.to_string(),
+            );
+            record.metadata.insert(
+                "replay_score".to_string(),
+                format!("{:.3}", replay.replay_score),
+            );
+            let started = {
+                let mut trials = self.trials.write().await;
+                trials.activate_queued_trial(record, candidate_snapshot.genome)?
+            };
+            self.ledger
+                .write_trial_record(started.record.clone())
+                .await?;
+            self.ledger
+                .append_event(
+                    LedgerEvent::new(
+                        LedgerEventKind::TrialStarted,
+                        serde_json::json!({
+                            "suggestion_id": started.suggestion_id.to_string(),
+                            "base_genome_id": started.base_genome_id.to_string(),
+                            "candidate_genome_id": started.candidate_genome_id.to_string(),
+                            "source": "queued_candidate",
+                            "selection_policy": "pareto_empirical_candidate_score_v1",
+                            "selection_score": evaluation.score.total_score,
+                            "selection_reasons": evaluation.score.reasons,
+                            "pareto_frontier_size": frontier_size,
+                            "candidate_objectives": {
+                                "expected_value": evaluation.objectives.expected_value,
+                                "safety": evaluation.objectives.safety,
+                                "historical_fit": evaluation.objectives.historical_fit,
+                                "replay_fit": evaluation.objectives.replay_fit,
+                                "complexity_cost": evaluation.objectives.complexity_cost,
+                                "exposure_cost": evaluation.objectives.exposure_cost,
+                            },
+                            "historical_replay": {
+                                "trace_count": replay.trace_count,
+                                "eligible_trace_count": replay.eligible_trace_count,
+                                "candidate_route_count": replay.candidate_route_count,
+                                "changed_route_count": replay.changed_route_count,
+                                "affected_route_count": replay.affected_route_count,
+                                "replay_score": replay.replay_score,
+                                "reasons": replay.reasons,
+                            },
+                        }),
+                    )?
+                    .with_node(self.node_id.clone())
+                    .with_genome(started.candidate_genome_id.clone())
+                    .with_suggestion(started.suggestion_id),
+                )
+                .await?;
+            return Ok(Some(started.candidate_genome_id));
+        }
+
+        Ok(None)
+    }
+
     pub async fn register_trial_worker(&self, node_id: NodeId) -> Result<(), ControllerError> {
         let record = {
             let mut trials = self.trials.write().await;
@@ -215,6 +446,33 @@ impl ControllerRuntime {
         self.log_trial_decision(&evaluation).await?;
         self.apply_trial_decision(&evaluation).await?;
         Ok(evaluation)
+    }
+
+    async fn reject_queued_trial_record(
+        &self,
+        mut record: StoredTrialRecord,
+        reason: impl Into<String>,
+    ) -> Result<(), ControllerError> {
+        let reason = reason.into();
+        record.mark_rejected(reason.clone());
+        self.ledger.write_trial_record(record.clone()).await?;
+        self.ledger
+            .append_event(
+                LedgerEvent::new(
+                    LedgerEventKind::TrialRejected,
+                    serde_json::json!({
+                        "trial_id": record.trial_id.to_string(),
+                        "base_genome_id": record.base_genome_id.to_string(),
+                        "candidate_genome_id": record.candidate_genome_id.to_string(),
+                        "reason": reason,
+                    }),
+                )?
+                .with_node(self.node_id.clone())
+                .with_genome(record.candidate_genome_id)
+                .with_suggestion(record.trial_id),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn run_forever(&self) -> Result<(), ControllerError> {
@@ -386,6 +644,9 @@ impl ControllerRuntime {
                     .with_task(result.task_id.clone());
                 self.ledger.append_event(event).await?;
                 self.record_trial_trace_for_result(&result).await?;
+                if result_is_shadow_trial(&result) {
+                    return Ok(ControllerHandleOutcome::Ignored);
+                }
                 Ok(ControllerHandleOutcome::ReceivedTaskResult(result))
             }
             payload if payload == BuiltinPayloadType::AlgedonicSignal.as_str() => {
@@ -414,11 +675,7 @@ impl ControllerRuntime {
                 .insert("routed_by".to_string(), self.node_id.to_string());
             task.metadata
                 .insert("routing_reason".to_string(), trial_route.reason.clone());
-            tag_task_for_trial(
-                &mut task,
-                &trial_route.suggestion_id,
-                &trial_route.genome_id,
-            );
+            tag_task_for_trial_route(&mut task, &trial_route);
 
             self.publish_routed_task(
                 task,
@@ -428,10 +685,18 @@ impl ControllerRuntime {
                 trial_route.genome_id,
                 true,
                 Some(trial_route.suggestion_id),
+                false,
             )
             .await
         } else {
-            self.log_trial_fallback_if_approved(&task).await?;
+            let maybe_shadow_route = {
+                let trials = self.trials.read().await;
+                trials.choose_shadow_route(&self.config.router, &self.node_id, &task)?
+            };
+            if maybe_shadow_route.is_none() {
+                self.log_trial_fallback_if_approved(&task).await?;
+            }
+            let shadow_task = maybe_shadow_route.as_ref().map(|_| task.clone());
 
             let (genome_id, parent, decision) = {
                 let genome = self.genome.read().await;
@@ -452,9 +717,45 @@ impl ControllerRuntime {
             let reason = decision.reason.clone();
             let child_id = decision.child_id.clone();
             let _ = parent;
-            self.publish_routed_task(task, incoming, child_id, reason, genome_id, false, None)
-                .await
+            let routed = self
+                .publish_routed_task(
+                    task, incoming, child_id, reason, genome_id, false, None, false,
+                )
+                .await?;
+            if let (Some(mut shadow_task), Some(shadow_route)) = (shadow_task, maybe_shadow_route) {
+                self.publish_shadow_task(&mut shadow_task, incoming, shadow_route)
+                    .await?;
+            }
+            Ok(routed)
         }
+    }
+
+    async fn publish_shadow_task(
+        &self,
+        task: &mut TaskPacket,
+        incoming: Option<&MessageEnvelope>,
+        shadow_route: crate::TrialRouteDecision,
+    ) -> Result<(), ControllerError> {
+        task.assigned_to = Some(shadow_route.child_id.clone());
+        task.metadata
+            .insert("routed_by".to_string(), self.node_id.to_string());
+        task.metadata
+            .insert("routing_reason".to_string(), shadow_route.reason.clone());
+        tag_task_for_trial_route(task, &shadow_route);
+
+        let _ = self
+            .publish_routed_task(
+                task.clone(),
+                incoming,
+                shadow_route.child_id,
+                shadow_route.reason,
+                shadow_route.genome_id,
+                true,
+                Some(shadow_route.suggestion_id),
+                true,
+            )
+            .await?;
+        Ok(())
     }
 
     async fn log_trial_fallback_if_approved(
@@ -495,6 +796,7 @@ impl ControllerRuntime {
         genome_id: vsm_core::GenomeId,
         is_trial_route: bool,
         suggestion_id: Option<vsm_core::SuggestionId>,
+        is_shadow_route: bool,
     ) -> Result<RoutedTask, ControllerError> {
         let parent_name = {
             let genome = self.genome.read().await;
@@ -514,8 +816,16 @@ impl ControllerRuntime {
                 reason: reason.clone(),
                 parent_name,
                 is_trial_route,
+                is_shadow_route,
                 suggestion_id: suggestion_id.as_ref().map(ToString::to_string),
                 routed_genome_id: genome_id.to_string(),
+                trial_mode: task.metadata.get("trial_mode").cloned(),
+                trial_exposure_basis_points: task
+                    .metadata
+                    .get("trial_exposure_basis_points")
+                    .cloned(),
+                trial_exposure_bucket: task.metadata.get("trial_exposure_bucket").cloned(),
+                trial_route_role: task.metadata.get("trial_route_role").cloned(),
             },
         )?
         .with_genome(genome_id.clone())
@@ -534,6 +844,9 @@ impl ControllerRuntime {
                                 "task_id": task.id.to_string(),
                                 "child_node_id": child_id.to_string(),
                                 "candidate_genome_id": genome_id.to_string(),
+                                "is_shadow_route": is_shadow_route,
+                                "trial_mode": task.metadata.get("trial_mode").cloned(),
+                                "trial_route_role": task.metadata.get("trial_route_role").cloned(),
                             }),
                         )?
                         .with_node(self.node_id.clone())
@@ -810,8 +1123,38 @@ struct TaskRoutedPayload {
     reason: String,
     parent_name: String,
     is_trial_route: bool,
+    is_shadow_route: bool,
     suggestion_id: Option<String>,
     routed_genome_id: String,
+    trial_mode: Option<String>,
+    trial_exposure_basis_points: Option<String>,
+    trial_exposure_bucket: Option<String>,
+    trial_route_role: Option<String>,
+}
+
+fn result_is_shadow_trial(result: &TaskResult) -> bool {
+    result
+        .metadata
+        .get("trial_shadow")
+        .map(|value| value == "true")
+        .unwrap_or(false)
+        || result
+            .metadata
+            .get("trial_route_role")
+            .map(|value| value == "shadow")
+            .unwrap_or(false)
+}
+
+fn format_candidate_objectives(objectives: &crate::CandidateObjectives) -> String {
+    format!(
+        "expected_value={:.3};safety={:.3};historical_fit={:.3};replay_fit={:.3};complexity_cost={:.3};exposure_cost={:.3}",
+        objectives.expected_value,
+        objectives.safety,
+        objectives.historical_fit,
+        objectives.replay_fit,
+        objectives.complexity_cost,
+        objectives.exposure_cost
+    )
 }
 
 fn task_priority(task: &TaskPacket) -> ChannelPriority {
@@ -827,4 +1170,591 @@ fn routed_envelope_metadata(reason: &str) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     metadata.insert("routing_reason".to_string(), reason.to_string());
     metadata
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use vsm_core::{
+        GeneSuggestionSource, GenomeId, LeafOperationSpec, OrganizationalGenome,
+        OrganizationalGenomePatch, Subscription, System5Policy, TaskId, TaskTrace, Transport,
+        TrialMode, ViableNode,
+    };
+    use vsm_ledger::{InMemoryLedger, StoredTrialRecord, StoredTrialStatus};
+    use vsm_runtime::InMemoryTransport;
+
+    fn genome_and_review_suggestion() -> (OrganizationalGenome, GeneSuggestion, vsm_core::NodeId) {
+        let root = ViableNode::new_metasystem("root");
+        let root_id = root.id.clone();
+        let mut genome = OrganizationalGenome::new(root);
+        let coder = ViableNode::new_leaf("coder", LeafOperationSpec::coding());
+        genome.add_child(&root_id, coder).expect("coder");
+
+        let mut reviewer = ViableNode::new_leaf("reviewer", LeafOperationSpec::reviewer());
+        reviewer.system_5 = System5Policy {
+            identity: "Candidate reviewer leaf.".to_string(),
+            values: vec![],
+            non_negotiable_constraints: vec!["Do not write code.".to_string()],
+            denied_capabilities: vec!["write_code".to_string()],
+        };
+        let reviewer_id = reviewer.id.clone();
+
+        let suggestion = GeneSuggestion::new(
+            root_id.clone(),
+            root_id,
+            GeneSuggestionSource::System3StarAudit,
+            OrganizationalGenomePatch::AddChild {
+                parent_id: genome.root_node_id.clone(),
+                child: reviewer,
+            },
+            "queue reviewer",
+        );
+
+        (genome, suggestion, reviewer_id)
+    }
+
+    fn controller_for(
+        genome: OrganizationalGenome,
+        ledger: Arc<InMemoryLedger>,
+    ) -> (ControllerRuntime, SharedGenome) {
+        let root_id = genome.root_node_id.clone();
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new(16));
+        let ledger: Arc<dyn Ledger> = ledger;
+        let controller = ControllerRuntime::new(root_id, shared_genome.clone(), transport, ledger);
+        (controller, shared_genome)
+    }
+
+    #[tokio::test]
+    async fn queued_candidate_is_not_active_until_started() {
+        let (genome, suggestion, reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+
+        let candidate_genome_id = controller
+            .queue_candidate_from_suggestion(suggestion.clone())
+            .await
+            .expect("queue candidate");
+
+        assert!(controller.active_candidate_genome().await.is_none());
+        let queued = ledger
+            .queued_trial_records(&root_id, 10)
+            .await
+            .expect("queued records");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].trial_id, suggestion.id);
+        assert_eq!(queued[0].status, StoredTrialStatus::Queued);
+
+        let started = controller
+            .start_next_queued_trial()
+            .await
+            .expect("start queued candidate");
+        assert_eq!(started, Some(candidate_genome_id.clone()));
+
+        let active = controller
+            .active_candidate_genome()
+            .await
+            .expect("active candidate");
+        assert_eq!(active.id, candidate_genome_id);
+        assert!(active.nodes.contains_key(&reviewer_id));
+
+        let active_record = ledger
+            .get_active_trial_record(&root_id)
+            .await
+            .expect("active record query")
+            .expect("active record");
+        assert_eq!(active_record.trial_id, suggestion.id);
+        assert_eq!(active_record.status, StoredTrialStatus::Active);
+        assert!(ledger
+            .queued_trial_records(&root_id, 10)
+            .await
+            .expect("queued records")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_activation_selects_best_scored_candidate_not_fifo() {
+        let (genome, mut low_suggestion, _reviewer_id) = genome_and_review_suggestion();
+        low_suggestion.trial_mode = TrialMode::Direct;
+        low_suggestion.source = GeneSuggestionSource::Other("manual".to_string());
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+
+        let low_candidate = controller
+            .queue_candidate_from_suggestion(low_suggestion)
+            .await
+            .expect("queue low candidate");
+
+        let reviewer = ViableNode::new_leaf("high-scored-reviewer", LeafOperationSpec::reviewer());
+        let mut high_suggestion = GeneSuggestion::new(
+            root_id.clone(),
+            root_id.clone(),
+            GeneSuggestionSource::AlgedonicSignal,
+            OrganizationalGenomePatch::AddChild {
+                parent_id: root_id.clone(),
+                child: reviewer,
+            },
+            "high scored candidate",
+        );
+        high_suggestion.trial_mode = TrialMode::Canary;
+        high_suggestion.safety_limits.max_tasks = Some(10);
+        high_suggestion.safety_limits.max_traffic_share_basis_points = Some(500);
+        high_suggestion.evidence.push("pain signal".to_string());
+        let high_candidate = controller
+            .queue_candidate_from_suggestion(high_suggestion)
+            .await
+            .expect("queue high candidate");
+
+        let started = controller
+            .start_next_queued_trial()
+            .await
+            .expect("start best candidate")
+            .expect("candidate started");
+
+        assert_eq!(started, high_candidate);
+        assert_ne!(started, low_candidate);
+
+        let active = ledger
+            .get_active_trial_record(&root_id)
+            .await
+            .expect("active record")
+            .expect("active trial");
+        assert_eq!(active.candidate_genome_id, high_candidate);
+        assert_eq!(
+            active.metadata.get("selection_policy").map(String::as_str),
+            Some("pareto_empirical_candidate_score_v1")
+        );
+        assert!(active.metadata.contains_key("selection_score"));
+        assert!(active.metadata.contains_key("pareto_frontier_size"));
+        assert!(active.metadata.contains_key("candidate_objectives"));
+    }
+
+    #[tokio::test]
+    async fn queued_activation_filters_dominated_candidate_before_score_tie_break() {
+        let (genome, mut dominated_suggestion, _reviewer_id) = genome_and_review_suggestion();
+        dominated_suggestion.trial_mode = TrialMode::Direct;
+        dominated_suggestion.source = GeneSuggestionSource::Other("manual".to_string());
+        let dominated_suggestion_id = dominated_suggestion.id.clone();
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+
+        let dominated_candidate = controller
+            .queue_candidate_from_suggestion(dominated_suggestion)
+            .await
+            .expect("queue dominated candidate");
+        let mut dominated_record = ledger
+            .get_trial_record(&dominated_suggestion_id)
+            .await
+            .expect("load dominated record")
+            .expect("dominated record");
+        dominated_record
+            .metadata
+            .insert("selection_priority".to_string(), "1000".to_string());
+        ledger
+            .write_trial_record(dominated_record)
+            .await
+            .expect("boost dominated candidate");
+
+        let reviewer = ViableNode::new_leaf("dominant-reviewer", LeafOperationSpec::reviewer());
+        let mut dominant_suggestion = GeneSuggestion::new(
+            root_id.clone(),
+            root_id.clone(),
+            GeneSuggestionSource::AlgedonicSignal,
+            OrganizationalGenomePatch::AddChild {
+                parent_id: root_id.clone(),
+                child: reviewer,
+            },
+            "dominant bounded canary",
+        );
+        dominant_suggestion.trial_mode = TrialMode::Canary;
+        dominant_suggestion.safety_limits.max_tasks = Some(10);
+        dominant_suggestion.safety_limits.max_token_budget = Some(5_000);
+        dominant_suggestion
+            .safety_limits
+            .max_traffic_share_basis_points = Some(500);
+        dominant_suggestion.evidence.push("pain signal".to_string());
+        let dominant_candidate = controller
+            .queue_candidate_from_suggestion(dominant_suggestion)
+            .await
+            .expect("queue dominant candidate");
+
+        let started = controller
+            .start_next_queued_trial()
+            .await
+            .expect("start best candidate")
+            .expect("candidate started");
+
+        assert_eq!(started, dominant_candidate);
+        assert_ne!(started, dominated_candidate);
+        let active = ledger
+            .get_active_trial_record(&root_id)
+            .await
+            .expect("active record")
+            .expect("active trial");
+        assert_eq!(
+            active
+                .metadata
+                .get("pareto_frontier_size")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_activation_records_historical_replay_summary() {
+        let (genome, mut suggestion, _reviewer_id) = genome_and_review_suggestion();
+        suggestion.trial_mode = TrialMode::Canary;
+        suggestion.safety_limits.max_tasks = Some(10);
+        suggestion.safety_limits.max_traffic_share_basis_points = Some(10_000);
+        let root_id = genome.root_node_id.clone();
+        let genome_id = genome.id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+
+        let candidate = controller
+            .queue_candidate_from_suggestion(suggestion)
+            .await
+            .expect("queue candidate");
+
+        let mut trace = TaskTrace::started(TaskId::new(), genome_id, vsm_core::NodeId::new());
+        trace.metadata.insert(
+            "task_metadata.required_capability".to_string(),
+            "review".to_string(),
+        );
+        trace.files_touched.push("src/lib.rs".to_string());
+        trace.outcome_score = -1.0;
+        trace.merged = Some(false);
+        ledger.write_task_trace(trace).await.expect("write trace");
+
+        let started = controller
+            .start_next_queued_trial()
+            .await
+            .expect("start candidate")
+            .expect("candidate started");
+        assert_eq!(started, candidate);
+
+        let active = ledger
+            .get_active_trial_record(&root_id)
+            .await
+            .expect("active record")
+            .expect("active trial");
+        assert_eq!(
+            active
+                .metadata
+                .get("replay_affected_route_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(active
+            .metadata
+            .get("candidate_objectives")
+            .is_some_and(|value| value.contains("replay_fit=")));
+        assert!(active
+            .metadata
+            .get("replay_score")
+            .and_then(|value| value.parse::<f64>().ok())
+            .is_some_and(|score| score > 0.0));
+    }
+
+    #[tokio::test]
+    async fn queued_activation_uses_completed_trial_history() {
+        let (genome, mut historically_good_suggestion, _reviewer_id) =
+            genome_and_review_suggestion();
+        historically_good_suggestion.trial_mode = TrialMode::Canary;
+        historically_good_suggestion.source = GeneSuggestionSource::System3StarAudit;
+        let root_id = genome.root_node_id.clone();
+        let genome_id = genome.id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+
+        let historically_good_candidate = controller
+            .queue_candidate_from_suggestion(historically_good_suggestion.clone())
+            .await
+            .expect("queue history-matching candidate");
+
+        let reviewer = ViableNode::new_leaf("urgent-reviewer", LeafOperationSpec::reviewer());
+        let mut urgent_suggestion = GeneSuggestion::new(
+            root_id.clone(),
+            root_id.clone(),
+            GeneSuggestionSource::AlgedonicSignal,
+            OrganizationalGenomePatch::AddChild {
+                parent_id: root_id.clone(),
+                child: reviewer,
+            },
+            "urgent but no matching history",
+        );
+        urgent_suggestion.trial_mode = TrialMode::Direct;
+        urgent_suggestion.safety_limits.max_tasks = Some(10);
+        let urgent_candidate = controller
+            .queue_candidate_from_suggestion(urgent_suggestion)
+            .await
+            .expect("queue urgent candidate");
+
+        let historical_reviewer =
+            ViableNode::new_leaf("historical-reviewer", LeafOperationSpec::reviewer());
+        let mut historical_suggestion = GeneSuggestion::new(
+            root_id.clone(),
+            root_id.clone(),
+            GeneSuggestionSource::System3StarAudit,
+            OrganizationalGenomePatch::AddChild {
+                parent_id: root_id.clone(),
+                child: historical_reviewer,
+            },
+            "historical good canary",
+        );
+        historical_suggestion.trial_mode = TrialMode::Canary;
+        let mut historical_record = StoredTrialRecord::active(
+            root_id.clone(),
+            genome_id,
+            GenomeId::new(),
+            historical_suggestion,
+        );
+        historical_record.status = StoredTrialStatus::Promoted;
+        historical_record.trace_count = 2;
+        historical_record.total_score = 100.0;
+        historical_record.completed_at = Some(chrono::Utc::now());
+        ledger
+            .write_trial_record(historical_record)
+            .await
+            .expect("historical trial");
+
+        let started = controller
+            .start_next_queued_trial()
+            .await
+            .expect("start best candidate")
+            .expect("candidate started");
+
+        assert_eq!(started, historically_good_candidate);
+        assert_ne!(started, urgent_candidate);
+        let active = ledger
+            .get_active_trial_record(&root_id)
+            .await
+            .expect("active record")
+            .expect("active trial");
+        assert!(active
+            .metadata
+            .get("selection_reasons")
+            .is_some_and(|reasons| reasons.contains("history_same_source")));
+    }
+
+    #[tokio::test]
+    async fn stale_queued_candidate_is_rejected_when_champion_moves() {
+        let (genome, suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, shared_genome) = controller_for(genome, ledger.clone());
+
+        controller
+            .queue_candidate_from_suggestion(suggestion.clone())
+            .await
+            .expect("queue candidate");
+
+        shared_genome.write().await.id = GenomeId::new();
+
+        let started = controller
+            .start_next_queued_trial()
+            .await
+            .expect("start next queued");
+        assert!(started.is_none());
+        assert!(controller.active_candidate_genome().await.is_none());
+
+        let record = ledger
+            .get_trial_record(&suggestion.id)
+            .await
+            .expect("trial record")
+            .expect("record exists");
+        assert_eq!(record.status, StoredTrialStatus::Rejected);
+        assert!(record
+            .metadata
+            .get("rejection_reason")
+            .is_some_and(|reason| reason.starts_with("base genome superseded")));
+
+        let rejected_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TrialRejected],
+                node_id: Some(root_id),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("rejected events");
+        assert_eq!(rejected_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_active_trial_blocks_queued_activation_after_restart() {
+        let (genome, suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let champion_id = genome.id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+
+        controller
+            .queue_candidate_from_suggestion(suggestion)
+            .await
+            .expect("queue candidate");
+
+        let reviewer = ViableNode::new_leaf("active-reviewer", LeafOperationSpec::reviewer());
+        let active_suggestion = GeneSuggestion::new(
+            root_id.clone(),
+            root_id.clone(),
+            GeneSuggestionSource::System3StarAudit,
+            OrganizationalGenomePatch::AddChild {
+                parent_id: root_id,
+                child: reviewer,
+            },
+            "already active elsewhere",
+        );
+        let active_trial_id = active_suggestion.id.clone();
+        ledger
+            .write_trial_record(StoredTrialRecord::active(
+                controller.node_id.clone(),
+                champion_id,
+                GenomeId::new(),
+                active_suggestion,
+            ))
+            .await
+            .expect("write durable active");
+
+        let err = controller
+            .start_next_queued_trial()
+            .await
+            .expect_err("durable active trial should block activation");
+        match err {
+            ControllerError::TrialAlreadyActive(suggestion_id) => {
+                assert_eq!(suggestion_id, active_trial_id);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shadow_trial_publishes_candidate_copy_after_champion_route() {
+        let (genome, mut suggestion, reviewer_id) = genome_and_review_suggestion();
+        suggestion.trial_mode = TrialMode::Shadow;
+        let suggestion_id = suggestion.id.clone();
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let _keepalive = transport
+            .subscribe(Subscription {
+                channel_types: vec![],
+                target_node_id: None,
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+
+        controller
+            .start_trial_from_suggestion(suggestion)
+            .await
+            .expect("start shadow trial");
+        controller
+            .register_trial_worker(reviewer_id.clone())
+            .await
+            .expect("register shadow worker");
+
+        let mut task = TaskPacket::new("shadow task", "publish primary and shadow work");
+        task.metadata
+            .insert("target_child".to_string(), "reviewer".to_string());
+        task.metadata
+            .insert("trial_approved".to_string(), suggestion_id.to_string());
+
+        let routed = controller.route_task(task, None).await.expect("route task");
+        assert_ne!(routed.child_id, reviewer_id);
+
+        let task_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskRouted],
+                node_id: Some(root_id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("task route events");
+        assert_eq!(task_events.len(), 2);
+        assert!(task_events
+            .iter()
+            .any(|event| event.payload["is_shadow_route"] == false));
+
+        let shadow_event = task_events
+            .iter()
+            .find(|event| event.payload["is_shadow_route"] == true)
+            .expect("shadow route event");
+        assert_eq!(
+            shadow_event.payload["child_node_id"].as_str(),
+            Some(reviewer_id.as_str())
+        );
+        assert_eq!(shadow_event.payload["trial_mode"].as_str(), Some("shadow"));
+        assert_eq!(
+            shadow_event.payload["trial_route_role"].as_str(),
+            Some("shadow")
+        );
+
+        let trial_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TrialTaskRouted],
+                node_id: Some(root_id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("trial route events");
+        assert_eq!(trial_events.len(), 1);
+        assert_eq!(trial_events[0].payload["is_shadow_route"], true);
+
+        let record = ledger
+            .get_active_trial_record(&root_id)
+            .await
+            .expect("active record")
+            .expect("active trial");
+        assert_eq!(record.routed_tasks, 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_trial_result_is_not_returned_as_controlling_result() {
+        let (genome, _suggestion, reviewer_id) = genome_and_review_suggestion();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+
+        let mut result = TaskResult::completed(vsm_core::TaskId::new(), reviewer_id, "shadow ok");
+        result
+            .metadata
+            .insert("trial_shadow".to_string(), "true".to_string());
+        result
+            .metadata
+            .insert("trial_route_role".to_string(), "shadow".to_string());
+
+        let envelope = vsm_core::envelope_for_task_result(&result)
+            .expect("result envelope")
+            .with_route(None, Some(controller.node_id.clone()));
+        let outcome = controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle result");
+        assert!(matches!(outcome, ControllerHandleOutcome::Ignored));
+
+        let events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskResultReceived],
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("result events");
+        assert_eq!(events.len(), 1);
+    }
 }

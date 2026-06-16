@@ -63,7 +63,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let suggestion_id = suggestion.id.clone();
 
-    let candidate_genome_id = controller.start_trial_from_suggestion(suggestion).await?;
+    let queued_genome_id = controller
+        .queue_candidate_from_suggestion(suggestion)
+        .await?;
+    assert!(controller.active_candidate_genome().await.is_none());
+    let candidate_genome_id = controller
+        .start_next_queued_trial()
+        .await?
+        .ok_or("queued candidate did not start")?;
+    assert_eq!(candidate_genome_id, queued_genome_id);
     controller
         .register_trial_worker(reviewer_id.clone())
         .await?;
@@ -157,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let events = ledger
         .recent_events(EventFilter {
             kinds: vec![
+                LedgerEventKind::TrialQueued,
                 LedgerEventKind::TrialStarted,
                 LedgerEventKind::TrialTaskRouted,
                 LedgerEventKind::TrialTraceRecorded,

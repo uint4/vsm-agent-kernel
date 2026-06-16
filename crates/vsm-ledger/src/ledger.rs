@@ -74,6 +74,18 @@ pub trait Ledger: Send + Sync {
         controller_node_id: &NodeId,
     ) -> Result<Option<StoredTrialRecord>, LedgerError>;
 
+    async fn queued_trial_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<StoredTrialRecord>, LedgerError>;
+
+    async fn completed_trial_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<StoredTrialRecord>, LedgerError>;
+
     async fn subtree_task_traces(
         &self,
         node_id: &NodeId,

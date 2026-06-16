@@ -33,4 +33,7 @@ pub enum ControllerError {
 
     #[error("no active mutation trial")]
     NoActiveTrial,
+
+    #[error("stored trial is not queued: {0}")]
+    TrialNotQueued(SuggestionId),
 }

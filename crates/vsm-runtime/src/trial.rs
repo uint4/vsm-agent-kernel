@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use vsm_core::{
-    summarize_direct_fitness, FitnessWeights, GeneSuggestion, GenomeId, NodeId,
-    OrganizationalGenome, PatchError, TaskTrace,
+    summarize_attributed_fitness, summarize_direct_fitness, AttributedFitnessSummary,
+    AttributionWeights, FitnessWeights, GeneSuggestion, GenomeId, NodeId, OrganizationalGenome,
+    PatchError, TaskTrace,
 };
 
 #[derive(Clone, Debug)]
@@ -114,6 +115,27 @@ impl MutationTrial {
             total_score: total,
         }
     }
+
+    pub fn attributed_fitness(
+        &self,
+        weights: &FitnessWeights,
+        attribution: &AttributionWeights,
+    ) -> BTreeMap<NodeId, AttributedFitnessSummary> {
+        self.attributed_fitness_with_complexity(
+            weights,
+            attribution,
+            &BTreeMap::<NodeId, f64>::new(),
+        )
+    }
+
+    pub fn attributed_fitness_with_complexity(
+        &self,
+        weights: &FitnessWeights,
+        attribution: &AttributionWeights,
+        complexity_by_node: &BTreeMap<NodeId, f64>,
+    ) -> BTreeMap<NodeId, AttributedFitnessSummary> {
+        summarize_attributed_fitness(&self.traces, weights, attribution, complexity_by_node)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -138,8 +160,8 @@ impl TrialLedger {
 #[cfg(test)]
 mod tests {
     use vsm_core::{
-        GeneSuggestion, GeneSuggestionSource, LeafOperationSpec, OrganizationalGenome,
-        OrganizationalGenomePatch, TaskId, TaskTrace, ViableNode,
+        AttributionWeights, GeneSuggestion, GeneSuggestionSource, LeafOperationSpec,
+        OrganizationalGenome, OrganizationalGenomePatch, TaskId, TaskTrace, ViableNode,
     };
 
     use super::*;
@@ -223,5 +245,32 @@ mod tests {
         );
 
         assert_eq!(evaluation.decision, TrialDecision::Prune);
+    }
+
+    #[test]
+    fn trial_reports_attributed_fitness_without_changing_decision_score() {
+        let mut trial = trial_with_traces(&[4.0, 4.0]);
+        let parent = trial.candidate_genome.root_node_id.clone();
+        for trace in &mut trial.traces {
+            trace.responsible_ancestor_ids.push(parent.clone());
+        }
+
+        let evaluation = trial.evaluate(
+            &TrialConfig {
+                min_tasks_before_decision: 2,
+                promote_margin: 7.0,
+                prune_below: -10.0,
+            },
+            &FitnessWeights::default(),
+        );
+        let attributed =
+            trial.attributed_fitness(&FitnessWeights::default(), &AttributionWeights::default());
+        let parent_summary = attributed.get(&parent).expect("parent summary");
+
+        assert_eq!(evaluation.decision, TrialDecision::Promote);
+        assert_eq!(evaluation.trace_count, 2);
+        assert_eq!(evaluation.total_score, 8.0);
+        assert_eq!(parent_summary.descendant_task_count, 2);
+        assert_eq!(parent_summary.descendant_score, 8.0);
     }
 }

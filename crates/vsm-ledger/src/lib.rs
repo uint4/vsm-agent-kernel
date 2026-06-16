@@ -61,6 +61,29 @@ mod tests {
         )
     }
 
+    fn queued_trial_record(
+        controller: vsm_core::NodeId,
+        genome: &OrganizationalGenome,
+    ) -> StoredTrialRecord {
+        let reviewer = ViableNode::new_leaf("queued-reviewer", LeafOperationSpec::reviewer());
+        let suggestion = GeneSuggestion::new(
+            controller.clone(),
+            controller.clone(),
+            GeneSuggestionSource::System3StarAudit,
+            OrganizationalGenomePatch::AddChild {
+                parent_id: controller.clone(),
+                child: reviewer,
+            },
+            "queue trial",
+        );
+        StoredTrialRecord::queued(
+            controller,
+            genome.id.clone(),
+            vsm_core::GenomeId::new(),
+            suggestion,
+        )
+    }
+
     async fn assert_state_roundtrip(ledger: &dyn Ledger) {
         let genome = genome();
         let controller = genome.root_node_id.clone();
@@ -97,6 +120,40 @@ mod tests {
             .expect("active trial")
             .expect("active exists");
         assert_eq!(active.trial_id, trial_id);
+
+        let queued_record = queued_trial_record(controller.clone(), &genome);
+        let queued_id = queued_record.trial_id.clone();
+        ledger
+            .write_trial_record(queued_record)
+            .await
+            .expect("queued trial");
+
+        let queued = ledger
+            .queued_trial_records(&controller, 10)
+            .await
+            .expect("queued trials");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].trial_id, queued_id);
+        assert_eq!(queued[0].status, StoredTrialStatus::Queued);
+
+        let mut completed = record.clone();
+        completed.status = StoredTrialStatus::Promoted;
+        completed.updated_at = chrono::Utc::now();
+        completed.completed_at = Some(completed.updated_at);
+        completed.trace_count = 3;
+        completed.total_score = 12.0;
+        ledger
+            .write_trial_record(completed.clone())
+            .await
+            .expect("completed trial");
+
+        let completed_records = ledger
+            .completed_trial_records(&controller, 10)
+            .await
+            .expect("completed trials");
+        assert_eq!(completed_records.len(), 1);
+        assert_eq!(completed_records[0].trial_id, completed.trial_id);
+        assert_eq!(completed_records[0].status, StoredTrialStatus::Promoted);
     }
 
     #[tokio::test]

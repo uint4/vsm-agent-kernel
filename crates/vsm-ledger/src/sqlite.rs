@@ -450,6 +450,71 @@ impl Ledger for SqliteLedger {
             .map(|json| serde_json::from_str(&json).map_err(LedgerError::from))
             .transpose()
     }
+
+    async fn queued_trial_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<StoredTrialRecord>, LedgerError> {
+        let limit = limit.max(1) as i64;
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT record_json
+                FROM trial_records
+                WHERE controller_node_id = ?1 AND status = 'queued'
+                ORDER BY started_at ASC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(LedgerError::from)?;
+        let rows = stmt
+            .query_map(params![controller_node_id.to_string(), limit], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(LedgerError::from)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let json = row.map_err(LedgerError::from)?;
+            records.push(serde_json::from_str(&json)?);
+        }
+        Ok(records)
+    }
+
+    async fn completed_trial_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<StoredTrialRecord>, LedgerError> {
+        let limit = limit.max(1) as i64;
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT record_json
+                FROM trial_records
+                WHERE controller_node_id = ?1
+                  AND status IN ('promoted', 'pruned', 'rejected', 'archived')
+                ORDER BY updated_at DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(LedgerError::from)?;
+        let rows = stmt
+            .query_map(params![controller_node_id.to_string(), limit], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(LedgerError::from)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let json = row.map_err(LedgerError::from)?;
+            records.push(serde_json::from_str(&json)?);
+        }
+        Ok(records)
+    }
 }
 
 fn filter_event(event: &LedgerEvent, filter: &EventFilter) -> bool {

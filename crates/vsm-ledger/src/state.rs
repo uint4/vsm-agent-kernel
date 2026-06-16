@@ -57,6 +57,7 @@ impl GenomeSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoredTrialStatus {
+    Queued,
     Active,
     Promoted,
     Pruned,
@@ -67,6 +68,7 @@ pub enum StoredTrialStatus {
 impl StoredTrialStatus {
     pub fn as_storage_key(&self) -> &'static str {
         match self {
+            Self::Queued => "queued",
             Self::Active => "active",
             Self::Promoted => "promoted",
             Self::Pruned => "pruned",
@@ -114,6 +116,22 @@ pub struct StoredTrialRecord {
 }
 
 impl StoredTrialRecord {
+    pub fn queued(
+        controller_node_id: NodeId,
+        base_genome_id: GenomeId,
+        candidate_genome_id: GenomeId,
+        suggestion: GeneSuggestion,
+    ) -> Self {
+        let mut record = Self::active(
+            controller_node_id,
+            base_genome_id,
+            candidate_genome_id,
+            suggestion,
+        );
+        record.status = StoredTrialStatus::Queued;
+        record
+    }
+
     pub fn active(
         controller_node_id: NodeId,
         base_genome_id: GenomeId,
@@ -139,5 +157,24 @@ impl StoredTrialRecord {
             registered_candidate_workers: vec![],
             metadata: BTreeMap::new(),
         }
+    }
+
+    pub fn mark_active(&mut self) {
+        let now = Utc::now();
+        self.status = StoredTrialStatus::Active;
+        self.started_at = now;
+        self.updated_at = now;
+        self.completed_at = None;
+        self.decision = None;
+    }
+
+    pub fn mark_rejected(&mut self, reason: impl Into<String>) {
+        let now = Utc::now();
+        self.status = StoredTrialStatus::Rejected;
+        self.updated_at = now;
+        self.completed_at = Some(now);
+        self.decision = None;
+        self.metadata
+            .insert("rejection_reason".to_string(), reason.into());
     }
 }

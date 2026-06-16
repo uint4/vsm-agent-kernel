@@ -162,14 +162,14 @@ The ledger stores:
 - genome patch events
 - genome snapshots
 - per-controller champion genome pointers
-- active and archived trial records
+- queued, active, and archived trial records
 
 Implementations:
 
 - `InMemoryLedger`
 - `SqliteLedger`
 
-The default subtree trace query uses `assigned_node_id` plus `responsible_ancestor_ids`, which is the minimum viable attribution model for early selection. SQLite and in-memory ledgers also persist enough genome/trial state for controller restart recovery.
+The default subtree trace query uses `assigned_node_id` plus `responsible_ancestor_ids`. `vsm-core` also exposes minimum viable attributed fitness summaries: direct workers receive direct credit/blame, the immediate responsible parent receives subtree credit/blame, and higher ancestors receive decayed credit/blame. SQLite and in-memory ledgers also persist enough genome/trial state for controller restart recovery and queued candidate activation.
 
 ## Controller
 
@@ -228,13 +228,21 @@ GeneSuggestion
 System 3* audit
   -> GeneSuggestion
   -> candidate genome
+  -> durable candidate queue
   -> bounded exposure
+  -> historical trace replay
   -> trial-tagged traces
-  -> empirical scoring
+  -> Pareto-front empirical selection
   -> promote, continue, or prune
 ```
 
-Candidate leaves are executable only when a worker harness is manually registered for the candidate node. The controller logs trial lifecycle events through the ledger, persists active trial state, and promotes by replacing the shared champion genome with the candidate genome. The promoted champion and active trial records can be loaded back from `vsm-ledger`.
+Candidate leaves are executable only when a worker harness is manually registered for the candidate node. The controller logs trial lifecycle events through the ledger, persists queued and active trial state, and promotes by replacing the shared champion genome with the candidate genome. The promoted champion and active trial records can be loaded back from `vsm-ledger`.
+
+Multiple candidates can be queued durably through `queue_candidate_from_suggestion`, but only one queued candidate can be activated at a time through `start_next_queued_trial`. Candidates whose base genome no longer matches the current champion are rejected before activation instead of being evaluated against the wrong baseline. Valid queued candidates are replayed against recent base-genome traces to estimate which historical tasks the candidate would have affected, then filtered to a Pareto frontier with `pareto_empirical_candidate_score_v1` over expected value, safety, historical fit, replay fit, complexity cost, and exposure cost. The remaining frontier candidates use the empirical score as a tie-breaker, combining suggestion source, trial mode, evidence count, explicit selection metadata, safety bounds, realized completed-trial history for matching source/mode/patch kind, replay score, and finally age.
+
+Trial routing now respects `trial_mode` and bounded exposure. `Probation` requires explicit approval unless a traffic-share limit is configured, `Canary` uses deterministic task/suggestion hashing against `max_traffic_share_basis_points`, `Direct` can take matching work without approval, and high/critical-risk canary or probation tasks still require explicit approval. `Shadow` mode publishes a non-controlling candidate copy after the champion route is selected; shadow results update trial evidence but are not returned as the controlling task result. Trial-routed task/result/trace metadata includes the mode, route role, and exposure bucket.
+
+Trial promotion/pruning still uses direct trial scores to avoid double-counting parent and child credit in one decision total. `MutationTrial::attributed_fitness` exposes per-node attributed summaries for audits, future subtree pruning, and later population-level selection.
 
 ## Current Status
 
@@ -243,13 +251,13 @@ Candidate leaves are executable only when a worker harness is manually registere
 | 1 | Leaf worker harness | Implemented |
 | 2 | Ledger | Implemented, including genome snapshots and trial state |
 | 3 | Parent controller | Implemented, basic version |
-| 4 | Subtree attribution | Partially implemented |
-| 5 | Simple fitness scoring | Partially implemented |
+| 4 | Subtree attribution | Implemented, minimum viable direct/ancestor model |
+| 5 | Simple fitness scoring | Implemented, basic direct and attributed summaries |
 | 6 | System 3* audit suggestions | Implemented, scaffold/rule-based version |
-| 7 | Bounded mutation experiments | Implemented for one active controller-managed trial |
+| 7 | Bounded mutation experiments | Implemented for queued candidates with replay-aware Pareto-front scored activation, one active controller-managed trial, deterministic canary/probation exposure, and shadow duplicate routing |
 | 8 | Promotion/pruning loop | Implemented for one active trial; full GA population loop is future work |
 
-The next milestone is a multi-candidate archive and richer routing/exposure policy. Do not jump to a broad GA population until attribution and rollback remain reliable under multiple overlapping candidates.
+The next milestone is a durable population/Pareto archive for non-overlapping candidate evolution, plus richer replay/eval coverage. Do not jump to a broad overlapping GA population until attribution and rollback remain reliable under queued candidates.
 
 ## Validation
 
@@ -345,6 +353,7 @@ The worker subscribes to `vsm.task_packet` messages on `VsmChannelType::Resource
 - Do not predefine a full specialist hierarchy.
 - Start with a minimal viable organization.
 - Let specialization emerge from observed task clusters and realized outcomes.
+- Let System 3 decompose and delegate through VSM channel traffic; derive task graphs from task lineage, dependencies, routing events, handoffs, results, and traces rather than making a separate planning artifact authoritative.
 - Use static predicates to guide routing and mutation opportunities, not to prove value.
 - Let System 3* suggest genes from audits.
 - Evaluate genes through bounded trials.
@@ -358,3 +367,4 @@ The worker subscribes to `vsm.task_packet` messages on `VsmChannelType::Resource
 - [Viable System Model](https://en.wikipedia.org/wiki/Viable_system_model)
 - [Evolutionary Algorithms](https://en.wikipedia.org/wiki/Evolutionary_algorithm)
 - [Conway's Law](https://en.wikipedia.org/wiki/Conway%27s_law)
+- [Pareto Efficiency](https://en.wikipedia.org/wiki/Pareto_efficiency)

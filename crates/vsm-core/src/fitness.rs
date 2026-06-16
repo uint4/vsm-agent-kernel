@@ -1,6 +1,6 @@
 use crate::{NodeId, TaskTrace};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FitnessWeights {
@@ -34,6 +34,29 @@ impl Default for FitnessWeights {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AttributionWeights {
+    pub direct_weight: f64,
+    pub ancestor_initial_weight: f64,
+    pub ancestor_decay: f64,
+}
+
+impl Default for AttributionWeights {
+    fn default() -> Self {
+        Self {
+            direct_weight: 1.0,
+            ancestor_initial_weight: 1.0,
+            ancestor_decay: 0.5,
+        }
+    }
+}
+
+impl AttributionWeights {
+    pub fn ancestor_weight(&self, depth: usize) -> f64 {
+        self.ancestor_initial_weight * self.ancestor_decay.powi(depth as i32)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FitnessSummary {
     pub node_id: NodeId,
     pub task_count: u64,
@@ -43,6 +66,24 @@ pub struct FitnessSummary {
     pub human_override_count: u64,
     pub tokens: u64,
     pub latency_ms: u64,
+    pub raw_score: f64,
+    pub complexity_penalty: f64,
+    pub final_score: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AttributedFitnessSummary {
+    pub node_id: NodeId,
+    pub direct_task_count: u64,
+    pub descendant_task_count: u64,
+    pub subtree_task_count: u64,
+    pub direct_tokens: u64,
+    pub subtree_tokens: u64,
+    pub direct_latency_ms: u64,
+    pub subtree_latency_ms: u64,
+    pub attribution_weight_total: f64,
+    pub direct_score: f64,
+    pub descendant_score: f64,
     pub raw_score: f64,
     pub complexity_penalty: f64,
     pub final_score: f64,
@@ -75,8 +116,7 @@ pub fn score_trace(trace: &TaskTrace, weights: &FitnessWeights) -> f64 {
     score
 }
 
-/// Computes direct fitness per assigned node. Ancestor/subtree credit assignment
-/// should be layered on by the runtime because it depends on the current genome.
+/// Computes direct fitness per assigned node.
 pub fn summarize_direct_fitness<'a>(
     traces: impl IntoIterator<Item = &'a TaskTrace>,
     weights: &FitnessWeights,
@@ -126,4 +166,212 @@ pub fn summarize_direct_fitness<'a>(
     }
 
     summaries
+}
+
+/// Computes fitness for directly assigned work plus credited descendant work.
+///
+/// `TaskTrace::responsible_ancestor_ids` is expected to be ordered from
+/// immediate parent outward. The immediate parent receives
+/// `ancestor_initial_weight`; each higher ancestor is decayed by
+/// `ancestor_decay`.
+pub fn summarize_attributed_fitness<'a>(
+    traces: impl IntoIterator<Item = &'a TaskTrace>,
+    weights: &FitnessWeights,
+    attribution: &AttributionWeights,
+    complexity_by_node: &BTreeMap<NodeId, f64>,
+) -> BTreeMap<NodeId, AttributedFitnessSummary> {
+    let mut summaries: BTreeMap<NodeId, AttributedFitnessSummary> = BTreeMap::new();
+
+    for trace in traces {
+        let trace_score = score_trace(trace, weights);
+        let direct_score = trace_score * attribution.direct_weight;
+        let token_total = trace.token_total();
+
+        let direct_entry = summaries
+            .entry(trace.assigned_node_id.clone())
+            .or_insert_with(|| empty_attributed_summary(trace.assigned_node_id.clone()));
+        direct_entry.direct_task_count += 1;
+        direct_entry.subtree_task_count += 1;
+        direct_entry.direct_tokens += token_total;
+        direct_entry.subtree_tokens += token_total;
+        direct_entry.direct_latency_ms += trace.latency_ms;
+        direct_entry.subtree_latency_ms += trace.latency_ms;
+        direct_entry.attribution_weight_total += attribution.direct_weight;
+        direct_entry.direct_score += direct_score;
+
+        let mut seen_ancestors = BTreeSet::new();
+        for (depth, ancestor_id) in trace.responsible_ancestor_ids.iter().enumerate() {
+            if ancestor_id == &trace.assigned_node_id || !seen_ancestors.insert(ancestor_id) {
+                continue;
+            }
+
+            let ancestor_weight = attribution.ancestor_weight(depth);
+            if ancestor_weight == 0.0 {
+                continue;
+            }
+
+            let ancestor_entry = summaries
+                .entry(ancestor_id.clone())
+                .or_insert_with(|| empty_attributed_summary(ancestor_id.clone()));
+            ancestor_entry.descendant_task_count += 1;
+            ancestor_entry.subtree_task_count += 1;
+            ancestor_entry.subtree_tokens += token_total;
+            ancestor_entry.subtree_latency_ms += trace.latency_ms;
+            ancestor_entry.attribution_weight_total += ancestor_weight;
+            ancestor_entry.descendant_score += trace_score * ancestor_weight;
+        }
+    }
+
+    for (node_id, summary) in summaries.iter_mut() {
+        summary.raw_score = summary.direct_score + summary.descendant_score;
+        let complexity = complexity_by_node.get(node_id).copied().unwrap_or(0.0);
+        summary.complexity_penalty = complexity * weights.org_complexity_weight;
+        summary.final_score = summary.raw_score - summary.complexity_penalty;
+    }
+
+    summaries
+}
+
+fn empty_attributed_summary(node_id: NodeId) -> AttributedFitnessSummary {
+    AttributedFitnessSummary {
+        node_id,
+        direct_task_count: 0,
+        descendant_task_count: 0,
+        subtree_task_count: 0,
+        direct_tokens: 0,
+        subtree_tokens: 0,
+        direct_latency_ms: 0,
+        subtree_latency_ms: 0,
+        attribution_weight_total: 0.0,
+        direct_score: 0.0,
+        descendant_score: 0.0,
+        raw_score: 0.0,
+        complexity_penalty: 0.0,
+        final_score: 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DelayedTraceAdjustment, GenomeId, TaskId};
+    use chrono::Utc;
+
+    fn trace_with_score(
+        assigned_node_id: NodeId,
+        responsible_ancestor_ids: Vec<NodeId>,
+        outcome_score: f64,
+    ) -> TaskTrace {
+        let mut trace = TaskTrace::started(
+            TaskId::from("task"),
+            GenomeId::from("genome"),
+            assigned_node_id,
+        );
+        trace.responsible_ancestor_ids = responsible_ancestor_ids;
+        trace.outcome_score = outcome_score;
+        trace
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < f64::EPSILON,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn attributed_fitness_credits_immediate_parent_for_subtree_work() {
+        let leaf = NodeId::from("leaf");
+        let parent = NodeId::from("parent");
+        let trace = trace_with_score(leaf.clone(), vec![parent.clone()], 10.0);
+
+        let summaries = summarize_attributed_fitness(
+            [&trace],
+            &FitnessWeights::default(),
+            &AttributionWeights::default(),
+            &BTreeMap::new(),
+        );
+
+        let leaf_summary = summaries.get(&leaf).expect("leaf summary");
+        assert_eq!(leaf_summary.direct_task_count, 1);
+        assert_eq!(leaf_summary.subtree_task_count, 1);
+        assert_close(leaf_summary.direct_score, 10.0);
+        assert_close(leaf_summary.final_score, 10.0);
+
+        let parent_summary = summaries.get(&parent).expect("parent summary");
+        assert_eq!(parent_summary.direct_task_count, 0);
+        assert_eq!(parent_summary.descendant_task_count, 1);
+        assert_eq!(parent_summary.subtree_task_count, 1);
+        assert_close(parent_summary.descendant_score, 10.0);
+        assert_close(parent_summary.final_score, 10.0);
+    }
+
+    #[test]
+    fn attributed_fitness_decays_credit_for_higher_ancestors() {
+        let leaf = NodeId::from("leaf");
+        let parent = NodeId::from("parent");
+        let root = NodeId::from("root");
+        let trace = trace_with_score(leaf, vec![parent.clone(), root.clone()], 8.0);
+
+        let summaries = summarize_attributed_fitness(
+            [&trace],
+            &FitnessWeights::default(),
+            &AttributionWeights::default(),
+            &BTreeMap::new(),
+        );
+
+        let parent_summary = summaries.get(&parent).expect("parent summary");
+        assert_close(parent_summary.descendant_score, 8.0);
+        assert_close(parent_summary.attribution_weight_total, 1.0);
+
+        let root_summary = summaries.get(&root).expect("root summary");
+        assert_close(root_summary.descendant_score, 4.0);
+        assert_close(root_summary.attribution_weight_total, 0.5);
+    }
+
+    #[test]
+    fn attributed_fitness_propagates_delayed_adjustments() {
+        let leaf = NodeId::from("leaf");
+        let parent = NodeId::from("parent");
+        let mut trace = trace_with_score(leaf.clone(), vec![parent.clone()], 10.0);
+        trace.delayed_adjustments.push(DelayedTraceAdjustment {
+            created_at: Utc::now(),
+            source: "post-merge-check".to_string(),
+            reason: "regression found later".to_string(),
+            delta_score: -3.0,
+        });
+
+        let summaries = summarize_attributed_fitness(
+            [&trace],
+            &FitnessWeights::default(),
+            &AttributionWeights::default(),
+            &BTreeMap::new(),
+        );
+
+        let leaf_summary = summaries.get(&leaf).expect("leaf summary");
+        assert_close(leaf_summary.direct_score, 7.0);
+
+        let parent_summary = summaries.get(&parent).expect("parent summary");
+        assert_close(parent_summary.descendant_score, 7.0);
+    }
+
+    #[test]
+    fn attributed_fitness_applies_complexity_penalty_per_node() {
+        let leaf = NodeId::from("leaf");
+        let trace = trace_with_score(leaf.clone(), vec![], 10.0);
+        let mut complexity_by_node = BTreeMap::new();
+        complexity_by_node.insert(leaf.clone(), 4.0);
+
+        let summaries = summarize_attributed_fitness(
+            [&trace],
+            &FitnessWeights::default(),
+            &AttributionWeights::default(),
+            &complexity_by_node,
+        );
+
+        let summary = summaries.get(&leaf).expect("leaf summary");
+        assert_close(summary.raw_score, 10.0);
+        assert_close(summary.complexity_penalty, 1.0);
+        assert_close(summary.final_score, 9.0);
+    }
 }
