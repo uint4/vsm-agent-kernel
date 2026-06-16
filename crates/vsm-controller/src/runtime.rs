@@ -276,8 +276,7 @@ impl ControllerRuntime {
             )?;
             let evaluation =
                 evaluate_queued_candidate_with_replay(&record, &completed_history, &replay);
-            let evaluation =
-                apply_environment_pressure(&record, evaluation, &environment_pressure);
+            let evaluation = apply_environment_pressure(&record, evaluation, &environment_pressure);
             selectable.push((record, candidate_snapshot, evaluation, replay));
         }
 
@@ -316,6 +315,7 @@ impl ControllerRuntime {
                 &frontier_index_set,
                 &record.trial_id,
                 frontier_size,
+                &environment_pressure,
             )
             .await?;
             record.metadata.insert(
@@ -415,7 +415,9 @@ impl ControllerRuntime {
         self.trials.read().await.active_candidate_genome()
     }
 
-    async fn recent_environment_pressure(&self) -> Result<EnvironmentPressureSummary, ControllerError> {
+    async fn recent_environment_pressure(
+        &self,
+    ) -> Result<EnvironmentPressureSummary, ControllerError> {
         let events = self
             .ledger
             .recent_events(EventFilter {
@@ -521,6 +523,7 @@ impl ControllerRuntime {
         frontier_indices: &BTreeSet<usize>,
         selected_trial_id: &vsm_core::SuggestionId,
         frontier_size: usize,
+        environment_pressure: &EnvironmentPressureSummary,
     ) -> Result<(), ControllerError> {
         for (candidate_index, trial, evaluation, replay) in archive_inputs {
             let status = if &trial.trial_id == selected_trial_id {
@@ -551,6 +554,7 @@ impl ControllerRuntime {
                 "suggestion_source".to_string(),
                 format!("{:?}", trial.suggestion.source),
             );
+            insert_environment_pressure_metadata(&mut archive.metadata, environment_pressure);
             insert_replay_metadata(&mut archive.metadata, replay)?;
             self.ledger.write_population_archive_record(archive).await?;
         }
@@ -1929,6 +1933,307 @@ fn environment_signal_event_name(channel_type: &VsmChannelType) -> &'static str 
         VsmChannelType::FutureProbeToEnvironment => "future_probe_environment_signal",
         VsmChannelType::EnvironmentToEnvironment => "environment_interaction_signal",
         _ => "environment_signal",
+    }
+}
+
+fn environment_signal_event_kinds() -> Vec<LedgerEventKind> {
+    vec![
+        LedgerEventKind::Other("operation_environment_signal".to_string()),
+        LedgerEventKind::Other("future_probe_environment_signal".to_string()),
+        LedgerEventKind::Other("environment_interaction_signal".to_string()),
+    ]
+}
+
+#[derive(Clone, Debug, Default)]
+struct EnvironmentPressureSummary {
+    event_count: u64,
+    risk_pressure: f64,
+    opportunity_pressure: f64,
+    feedback_pressure: f64,
+    future_probe_count: u64,
+    environment_interaction_count: u64,
+    max_severity: u8,
+    reasons: Vec<String>,
+}
+
+impl EnvironmentPressureSummary {
+    fn from_events(events: &[LedgerEvent]) -> Self {
+        let mut summary = Self::default();
+        for event in events {
+            summary.event_count += 1;
+            let severity = event
+                .payload
+                .get("severity")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(1)
+                .min(10) as u8;
+            summary.max_severity = summary.max_severity.max(severity);
+
+            let kind = event
+                .payload
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Observation");
+            let source_channel = event
+                .payload
+                .get("source_channel")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    event
+                        .metadata
+                        .get("source_channel")
+                        .map(std::string::String::as_str)
+                })
+                .unwrap_or("Unknown");
+            let pressure = f64::from(severity.max(1));
+
+            match kind {
+                "Risk" => summary.risk_pressure += pressure,
+                "Opportunity" => summary.opportunity_pressure += pressure,
+                "UserFeedback" => summary.feedback_pressure += pressure,
+                "DependencyChange" => summary.risk_pressure += pressure * 0.75,
+                "CapabilityChange" => summary.opportunity_pressure += pressure * 0.75,
+                _ => {}
+            }
+            match source_channel {
+                "FutureProbeToEnvironment" => {
+                    summary.future_probe_count += 1;
+                    if kind != "Opportunity" {
+                        summary.opportunity_pressure += pressure * 0.35;
+                    }
+                }
+                "EnvironmentToEnvironment" => {
+                    summary.environment_interaction_count += 1;
+                    if kind != "Risk" {
+                        summary.risk_pressure += pressure * 0.35;
+                    }
+                }
+                _ => {}
+            }
+
+            if summary.reasons.len() < 8 {
+                summary.reasons.push(format!(
+                    "environment_signal channel={source_channel} kind={kind} severity={severity}"
+                ));
+            }
+        }
+        summary
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "event_count": self.event_count,
+            "risk_pressure": self.risk_pressure,
+            "opportunity_pressure": self.opportunity_pressure,
+            "feedback_pressure": self.feedback_pressure,
+            "future_probe_count": self.future_probe_count,
+            "environment_interaction_count": self.environment_interaction_count,
+            "max_severity": self.max_severity,
+            "reasons": self.reasons,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.event_count == 0
+    }
+}
+
+fn apply_environment_pressure(
+    record: &StoredTrialRecord,
+    mut evaluation: crate::QueuedCandidateEvaluation,
+    pressure: &EnvironmentPressureSummary,
+) -> crate::QueuedCandidateEvaluation {
+    if pressure.is_empty() {
+        return evaluation;
+    }
+
+    let risk_bonus = environment_source_match(
+        &record.suggestion.source,
+        pressure.risk_pressure,
+        &[
+            (GeneSuggestionSourceKind::AlgedonicSignal, 1.0),
+            (GeneSuggestionSourceKind::System3StarAudit, 0.85),
+            (GeneSuggestionSourceKind::System1ResourceBargain, 0.65),
+            (GeneSuggestionSourceKind::System2CoordinationSignal, 0.50),
+            (GeneSuggestionSourceKind::System4FutureProbe, 0.25),
+            (GeneSuggestionSourceKind::Other, 0.20),
+        ],
+        18.0,
+        0.8,
+    );
+    if risk_bonus > 0.0 {
+        evaluation.objectives.expected_value += risk_bonus;
+        evaluation.score.total_score += risk_bonus;
+        evaluation.score.reasons.push(format!(
+            "environment_risk_pressure={:.3}",
+            pressure.risk_pressure
+        ));
+    }
+
+    let opportunity_bonus = environment_source_match(
+        &record.suggestion.source,
+        pressure.opportunity_pressure,
+        &[
+            (GeneSuggestionSourceKind::System4FutureProbe, 1.0),
+            (GeneSuggestionSourceKind::System3StarAudit, 0.35),
+            (GeneSuggestionSourceKind::System2CoordinationSignal, 0.30),
+            (GeneSuggestionSourceKind::System1ResourceBargain, 0.25),
+            (GeneSuggestionSourceKind::Other, 0.50),
+            (GeneSuggestionSourceKind::AlgedonicSignal, 0.15),
+        ],
+        16.0,
+        0.9,
+    );
+    if opportunity_bonus > 0.0 {
+        evaluation.objectives.expected_value += opportunity_bonus;
+        evaluation.score.total_score += opportunity_bonus;
+        evaluation.score.reasons.push(format!(
+            "environment_opportunity_pressure={:.3}",
+            pressure.opportunity_pressure
+        ));
+    }
+
+    let feedback_bonus = environment_source_match(
+        &record.suggestion.source,
+        pressure.feedback_pressure,
+        &[
+            (GeneSuggestionSourceKind::System1ResourceBargain, 0.75),
+            (GeneSuggestionSourceKind::System3StarAudit, 0.50),
+            (GeneSuggestionSourceKind::System2CoordinationSignal, 0.40),
+            (GeneSuggestionSourceKind::System4FutureProbe, 0.25),
+            (GeneSuggestionSourceKind::AlgedonicSignal, 0.25),
+            (GeneSuggestionSourceKind::Other, 0.25),
+        ],
+        8.0,
+        0.4,
+    );
+    if feedback_bonus > 0.0 {
+        evaluation.objectives.expected_value += feedback_bonus;
+        evaluation.score.total_score += feedback_bonus;
+        evaluation.score.reasons.push(format!(
+            "environment_feedback_pressure={:.3}",
+            pressure.feedback_pressure
+        ));
+    }
+
+    if pressure.risk_pressure > 0.0 && candidate_is_bounded(record) {
+        let safety_bonus = (pressure.risk_pressure * 0.3).min(8.0);
+        evaluation.objectives.safety += safety_bonus;
+        evaluation.score.total_score += safety_bonus;
+        evaluation.score.reasons.push(format!(
+            "environment_bounded_safety_bonus={safety_bonus:.3}"
+        ));
+    }
+
+    evaluation
+}
+
+fn candidate_is_bounded(record: &StoredTrialRecord) -> bool {
+    let limits = &record.suggestion.safety_limits;
+    limits.requires_approval
+        || limits.max_tasks.is_some()
+        || limits.max_token_budget.is_some()
+        || limits.max_traffic_share_basis_points.is_some()
+        || matches!(record.suggestion.trial_mode, vsm_core::TrialMode::Shadow)
+}
+
+#[derive(Clone, Copy)]
+enum GeneSuggestionSourceKind {
+    System3StarAudit,
+    System4FutureProbe,
+    System1ResourceBargain,
+    System2CoordinationSignal,
+    AlgedonicSignal,
+    Other,
+}
+
+fn environment_source_match(
+    source: &GeneSuggestionSource,
+    pressure: f64,
+    weights: &[(GeneSuggestionSourceKind, f64)],
+    max_bonus: f64,
+    scale: f64,
+) -> f64 {
+    if pressure <= 0.0 {
+        return 0.0;
+    }
+    let source_kind = source_kind(source);
+    let weight = weights
+        .iter()
+        .find_map(|(kind, weight)| source_kind_matches(source_kind, *kind).then_some(*weight))
+        .unwrap_or(0.0);
+    (pressure * scale * weight).min(max_bonus)
+}
+
+fn source_kind(source: &GeneSuggestionSource) -> GeneSuggestionSourceKind {
+    match source {
+        GeneSuggestionSource::System3StarAudit => GeneSuggestionSourceKind::System3StarAudit,
+        GeneSuggestionSource::System4FutureProbe => GeneSuggestionSourceKind::System4FutureProbe,
+        GeneSuggestionSource::System1ResourceBargain => {
+            GeneSuggestionSourceKind::System1ResourceBargain
+        }
+        GeneSuggestionSource::System2CoordinationSignal => {
+            GeneSuggestionSourceKind::System2CoordinationSignal
+        }
+        GeneSuggestionSource::AlgedonicSignal => GeneSuggestionSourceKind::AlgedonicSignal,
+        GeneSuggestionSource::Other(_) => GeneSuggestionSourceKind::Other,
+    }
+}
+
+fn source_kind_matches(left: GeneSuggestionSourceKind, right: GeneSuggestionSourceKind) -> bool {
+    matches!(
+        (left, right),
+        (
+            GeneSuggestionSourceKind::System3StarAudit,
+            GeneSuggestionSourceKind::System3StarAudit
+        ) | (
+            GeneSuggestionSourceKind::System4FutureProbe,
+            GeneSuggestionSourceKind::System4FutureProbe
+        ) | (
+            GeneSuggestionSourceKind::System1ResourceBargain,
+            GeneSuggestionSourceKind::System1ResourceBargain
+        ) | (
+            GeneSuggestionSourceKind::System2CoordinationSignal,
+            GeneSuggestionSourceKind::System2CoordinationSignal
+        ) | (
+            GeneSuggestionSourceKind::AlgedonicSignal,
+            GeneSuggestionSourceKind::AlgedonicSignal
+        ) | (
+            GeneSuggestionSourceKind::Other,
+            GeneSuggestionSourceKind::Other
+        )
+    )
+}
+
+fn insert_environment_pressure_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    pressure: &EnvironmentPressureSummary,
+) {
+    metadata.insert(
+        "environment_signal_count".to_string(),
+        pressure.event_count.to_string(),
+    );
+    metadata.insert(
+        "environment_risk_pressure".to_string(),
+        format!("{:.3}", pressure.risk_pressure),
+    );
+    metadata.insert(
+        "environment_opportunity_pressure".to_string(),
+        format!("{:.3}", pressure.opportunity_pressure),
+    );
+    metadata.insert(
+        "environment_feedback_pressure".to_string(),
+        format!("{:.3}", pressure.feedback_pressure),
+    );
+    metadata.insert(
+        "environment_max_severity".to_string(),
+        pressure.max_severity.to_string(),
+    );
+    if !pressure.reasons.is_empty() {
+        metadata.insert(
+            "environment_pressure_reasons".to_string(),
+            pressure.reasons.join("|"),
+        );
     }
 }
 
@@ -4109,6 +4414,198 @@ mod tests {
             .metadata
             .get("replay_trace_evaluations")
             .is_some_and(|value| value.contains("AffectedRoute")));
+    }
+
+    #[tokio::test]
+    async fn queued_activation_uses_future_probe_environment_opportunity_pressure() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+
+        let audit_reviewer =
+            ViableNode::new_leaf("audit-pressure-reviewer", LeafOperationSpec::reviewer());
+        let mut audit_suggestion = GeneSuggestion::new(
+            root_id.clone(),
+            root_id.clone(),
+            GeneSuggestionSource::System3StarAudit,
+            OrganizationalGenomePatch::AddChild {
+                parent_id: root_id.clone(),
+                child: audit_reviewer,
+            },
+            "audit pressure reviewer",
+        );
+        audit_suggestion.trial_mode = TrialMode::Canary;
+        audit_suggestion.safety_limits.max_tasks = Some(10);
+        audit_suggestion
+            .safety_limits
+            .max_traffic_share_basis_points = Some(500);
+        let audit_candidate = controller
+            .queue_candidate_from_suggestion(audit_suggestion)
+            .await
+            .expect("queue audit candidate");
+
+        let future_reviewer =
+            ViableNode::new_leaf("future-pressure-reviewer", LeafOperationSpec::reviewer());
+        let mut future_suggestion = GeneSuggestion::new(
+            root_id.clone(),
+            root_id.clone(),
+            GeneSuggestionSource::System4FutureProbe,
+            OrganizationalGenomePatch::AddChild {
+                parent_id: root_id.clone(),
+                child: future_reviewer,
+            },
+            "future probe opportunity reviewer",
+        );
+        future_suggestion.trial_mode = TrialMode::Canary;
+        future_suggestion.safety_limits.max_tasks = Some(10);
+        future_suggestion
+            .safety_limits
+            .max_traffic_share_basis_points = Some(500);
+        let future_candidate = controller
+            .queue_candidate_from_suggestion(future_suggestion)
+            .await
+            .expect("queue future candidate");
+
+        for summary in [
+            "New model-provider adapter can reduce worker integration cost.",
+            "Future probe sees upcoming review queue pressure.",
+        ] {
+            let mut signal = EnvironmentSignal::new(
+                vsm_core::EnvironmentSignalKind::Opportunity,
+                "future-probe",
+                summary,
+            );
+            signal.observed_by_node_id = Some(NodeId::new());
+            signal.target_node_id = Some(root_id.clone());
+            signal.severity = Some(10);
+            let envelope = MessageEnvelope::new(
+                VsmChannelType::FutureProbeToEnvironment,
+                BuiltinPayloadType::EnvironmentSignal.as_str(),
+                &signal,
+            )
+            .expect("future signal envelope")
+            .with_route(signal.observed_by_node_id.clone(), Some(root_id.clone()));
+            controller
+                .handle_envelope(envelope)
+                .await
+                .expect("record future pressure");
+        }
+
+        let started = controller
+            .start_next_queued_trial()
+            .await
+            .expect("start queued")
+            .expect("candidate started");
+
+        assert_eq!(started, future_candidate);
+        assert_ne!(started, audit_candidate);
+        let active = ledger
+            .get_active_trial_record(&root_id)
+            .await
+            .expect("active record")
+            .expect("active trial");
+        assert_eq!(
+            active
+                .metadata
+                .get("environment_signal_count")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert!(active
+            .metadata
+            .get("selection_reasons")
+            .is_some_and(|reasons| reasons.contains("environment_opportunity_pressure")));
+        assert!(active
+            .metadata
+            .get("candidate_objectives")
+            .is_some_and(|objectives| objectives.contains("expected_value=")));
+
+        let archive = ledger
+            .population_archive_records(&root_id, 10)
+            .await
+            .expect("population archive");
+        let selected = archive
+            .iter()
+            .find(|record| record.candidate_genome_id == future_candidate)
+            .expect("selected archive");
+        assert_eq!(
+            selected
+                .metadata
+                .get("environment_signal_count")
+                .map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_activation_records_environment_risk_pressure() {
+        let (genome, mut suggestion, _reviewer_id) = genome_and_review_suggestion();
+        suggestion.trial_mode = TrialMode::Canary;
+        suggestion.safety_limits.max_tasks = Some(10);
+        suggestion.safety_limits.max_token_budget = Some(5_000);
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let (controller, _shared_genome) = controller_for(genome, ledger.clone());
+        let candidate = controller
+            .queue_candidate_from_suggestion(suggestion)
+            .await
+            .expect("queue candidate");
+
+        let mut signal = EnvironmentSignal::new(
+            vsm_core::EnvironmentSignalKind::Risk,
+            "package-registry",
+            "Registry and CI availability conflict raises delivery risk.",
+        );
+        signal.target_environment = Some("ci".to_string());
+        signal.target_node_id = Some(root_id.clone());
+        signal.severity = Some(9);
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::EnvironmentToEnvironment,
+            BuiltinPayloadType::EnvironmentSignal.as_str(),
+            &signal,
+        )
+        .expect("risk envelope")
+        .with_route(None, Some(root_id.clone()));
+        controller
+            .handle_envelope(envelope)
+            .await
+            .expect("record risk pressure");
+
+        let started = controller
+            .start_next_queued_trial()
+            .await
+            .expect("start queued")
+            .expect("candidate started");
+        assert_eq!(started, candidate);
+
+        let active = ledger
+            .get_active_trial_record(&root_id)
+            .await
+            .expect("active record")
+            .expect("active trial");
+        assert_eq!(
+            active
+                .metadata
+                .get("environment_signal_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            active
+                .metadata
+                .get("environment_max_severity")
+                .map(String::as_str),
+            Some("9")
+        );
+        assert!(active
+            .metadata
+            .get("selection_reasons")
+            .is_some_and(|reasons| reasons.contains("environment_risk_pressure")));
+        assert!(active
+            .metadata
+            .get("selection_reasons")
+            .is_some_and(|reasons| reasons.contains("environment_bounded_safety_bonus")));
     }
 
     #[tokio::test]
