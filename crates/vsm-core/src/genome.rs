@@ -54,14 +54,22 @@ impl OrganizationalGenome {
     }
 
     pub fn get_node(&self, id: &NodeId) -> Result<&ViableNode, GenomeError> {
-        self.nodes.get(id).ok_or_else(|| GenomeError::NodeNotFound(id.clone()))
+        self.nodes
+            .get(id)
+            .ok_or_else(|| GenomeError::NodeNotFound(id.clone()))
     }
 
     pub fn get_node_mut(&mut self, id: &NodeId) -> Result<&mut ViableNode, GenomeError> {
-        self.nodes.get_mut(id).ok_or_else(|| GenomeError::NodeNotFound(id.clone()))
+        self.nodes
+            .get_mut(id)
+            .ok_or_else(|| GenomeError::NodeNotFound(id.clone()))
     }
 
-    pub fn add_child(&mut self, parent_id: &NodeId, mut child: ViableNode) -> Result<NodeId, GenomeError> {
+    pub fn add_child(
+        &mut self,
+        parent_id: &NodeId,
+        mut child: ViableNode,
+    ) -> Result<NodeId, GenomeError> {
         if !self.nodes.contains_key(parent_id) {
             return Err(GenomeError::NodeNotFound(parent_id.clone()));
         }
@@ -72,7 +80,9 @@ impl OrganizationalGenome {
         let child_id = child.id.clone();
         child.parent_id = Some(parent_id.clone());
         self.nodes.insert(child_id.clone(), child);
-        self.get_node_mut(parent_id)?.children.push(child_id.clone());
+        self.get_node_mut(parent_id)?
+            .children
+            .push(child_id.clone());
 
         let bundle = ParentChildChannelBundle::standard(parent_id.clone(), child_id.clone());
         for channel in [
@@ -113,15 +123,27 @@ impl OrganizationalGenome {
         }
 
         self.channels.retain(|ch| {
-            let from_removed = ch.from.as_ref().map(|id| removed.contains(id)).unwrap_or(false);
-            let to_removed = ch.to.as_ref().map(|id| removed.contains(id)).unwrap_or(false);
+            let from_removed = ch
+                .from
+                .as_ref()
+                .map(|id| removed.contains(id))
+                .unwrap_or(false);
+            let to_removed = ch
+                .to
+                .as_ref()
+                .map(|id| removed.contains(id))
+                .unwrap_or(false);
             !from_removed && !to_removed
         });
 
         Ok(removed)
     }
 
-    pub fn collect_subtree(&self, node_id: &NodeId, out: &mut Vec<NodeId>) -> Result<(), GenomeError> {
+    pub fn collect_subtree(
+        &self,
+        node_id: &NodeId,
+        out: &mut Vec<NodeId>,
+    ) -> Result<(), GenomeError> {
         let node = self.get_node(node_id)?;
         out.push(node_id.clone());
         for child_id in &node.children {

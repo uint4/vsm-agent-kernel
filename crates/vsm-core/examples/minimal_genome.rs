@@ -4,10 +4,7 @@ fn main() {
     let mut root = ViableNode::new_metasystem("root-controller");
     root.system_5.identity = "Autonomous coding organization root".to_string();
 
-    let code_service = ViableNode::new_leaf(
-        "primary-code-service",
-        LeafOperationSpec::coding(),
-    );
+    let code_service = ViableNode::new_leaf("primary-code-service", LeafOperationSpec::coding());
 
     let mut genome = OrganizationalGenome::new(root);
     let root_id = genome.root_node_id.clone();

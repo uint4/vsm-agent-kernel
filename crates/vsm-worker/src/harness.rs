@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use vsm_core::{
     envelope_for_task_result, BuiltinPayloadType, CapabilitySet, MessageEnvelope, NodeId,
-    OrganizationalGenome, Subscription, TaskArtifact, TaskPacket, TaskResult,
+    OrganizationalGenome, Subscription, SuggestionId, TaskArtifact, TaskPacket, TaskResult,
     TaskTrace, Transport, VsmChannelType,
 };
 
@@ -103,7 +103,10 @@ impl WorkerHarness {
         Ok(self.transport.subscribe(subscription).await?)
     }
 
-    async fn handle_envelope(&self, envelope: MessageEnvelope) -> Result<Option<TaskResult>, WorkerError> {
+    async fn handle_envelope(
+        &self,
+        envelope: MessageEnvelope,
+    ) -> Result<Option<TaskResult>, WorkerError> {
         if envelope.payload_type != BuiltinPayloadType::TaskPacket.as_str() {
             return Ok(None);
         }
@@ -162,7 +165,7 @@ impl WorkerHarness {
         }
         .await;
 
-        let (result, usage) = match execution {
+        let (mut result, usage) = match execution {
             Ok((result, usage)) => {
                 trace.outcome_score = 1.0;
                 trace.merged = None;
@@ -183,6 +186,8 @@ impl WorkerHarness {
             }
         };
 
+        copy_trial_metadata(&task, &mut result, &mut trace);
+
         if let Some(usage) = usage {
             trace.input_tokens = usage.input_tokens;
             trace.output_tokens = usage.output_tokens;
@@ -193,7 +198,9 @@ impl WorkerHarness {
         trace.latency_ms = (completed_at - started_at).num_milliseconds().max(0) as u64;
         trace.files_touched = result.files_touched.clone();
         trace.tests_run = result.tests_run.clone();
-        trace.metadata.insert("status".to_string(), format!("{:?}", result.status));
+        trace
+            .metadata
+            .insert("status".to_string(), format!("{:?}", result.status));
 
         self.trace_sink.record(trace).await?;
 
@@ -211,8 +218,8 @@ impl WorkerHarness {
         parent_id: Option<NodeId>,
     ) -> Result<(), WorkerError> {
         let target = incoming.source_node_id.clone().or(parent_id);
-        let mut envelope = envelope_for_task_result(result)?
-            .with_route(Some(self.node_id.clone()), target);
+        let mut envelope =
+            envelope_for_task_result(result)?.with_route(Some(self.node_id.clone()), target);
         envelope.correlation_id = incoming
             .correlation_id
             .clone()
@@ -226,13 +233,15 @@ impl WorkerHarness {
     }
 }
 
-
 fn harvest_provider_artifacts(raw: &Option<serde_json::Value>, result: &mut TaskResult) {
     let Some(raw) = raw else {
         return;
     };
 
-    if let Some(files) = raw.get("files_touched").and_then(serde_json::Value::as_array) {
+    if let Some(files) = raw
+        .get("files_touched")
+        .and_then(serde_json::Value::as_array)
+    {
         for file in files.iter().filter_map(serde_json::Value::as_str) {
             if !result.files_touched.iter().any(|existing| existing == file) {
                 result.files_touched.push(file.to_string());
@@ -242,14 +251,42 @@ fn harvest_provider_artifacts(raw: &Option<serde_json::Value>, result: &mut Task
 
     if let Some(artifacts) = raw.get("artifacts").and_then(serde_json::Value::as_array) {
         for artifact in artifacts {
-            result
-                .artifacts
-                .push(TaskArtifact::inline("provider_artifact", artifact.to_string()));
+            result.artifacts.push(TaskArtifact::inline(
+                "provider_artifact",
+                artifact.to_string(),
+            ));
         }
     }
 }
 
-fn ensure_executable_leaf(node: &vsm_core::ViableNode, task: &TaskPacket) -> Result<(), WorkerError> {
+fn copy_trial_metadata(task: &TaskPacket, result: &mut TaskResult, trace: &mut TaskTrace) {
+    for key in ["trial_id", "related_suggestion_id", "candidate_genome_id"] {
+        if let Some(value) = task.metadata.get(key) {
+            result.metadata.insert(key.to_string(), value.clone());
+            trace.metadata.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if let Some(value) = task
+        .metadata
+        .get("related_suggestion_id")
+        .or_else(|| task.metadata.get("trial_id"))
+    {
+        let suggestion_id = SuggestionId::from_string(value.clone());
+        if !trace
+            .related_suggestion_ids
+            .iter()
+            .any(|existing| existing == &suggestion_id)
+        {
+            trace.related_suggestion_ids.push(suggestion_id);
+        }
+    }
+}
+
+fn ensure_executable_leaf(
+    node: &vsm_core::ViableNode,
+    task: &TaskPacket,
+) -> Result<(), WorkerError> {
     if !node.is_leaf() {
         return Err(WorkerError::NotExecutableLeaf(node.id.clone()));
     }
@@ -295,5 +332,51 @@ fn require_capability(
             node_id: node_id.clone(),
             capability: capability.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vsm_core::{GenomeId, NodeId, SuggestionId, TaskId, TaskPacket, TaskResult, TaskTrace};
+
+    use super::copy_trial_metadata;
+
+    #[test]
+    fn trial_metadata_is_copied_to_result_and_trace() {
+        let suggestion_id = SuggestionId::new();
+        let candidate_genome_id = GenomeId::new();
+        let node_id = NodeId::new();
+        let mut task = TaskPacket::new("trial task", "exercise trial metadata");
+        task.metadata
+            .insert("trial_id".to_string(), suggestion_id.to_string());
+        task.metadata.insert(
+            "related_suggestion_id".to_string(),
+            suggestion_id.to_string(),
+        );
+        task.metadata.insert(
+            "candidate_genome_id".to_string(),
+            candidate_genome_id.to_string(),
+        );
+
+        let mut result = TaskResult::completed(TaskId::new(), node_id.clone(), "ok");
+        let mut trace = TaskTrace::started(TaskId::new(), candidate_genome_id.clone(), node_id);
+
+        copy_trial_metadata(&task, &mut result, &mut trace);
+
+        assert_eq!(
+            result.metadata.get("trial_id").map(String::as_str),
+            Some(suggestion_id.as_str())
+        );
+        assert_eq!(
+            result
+                .metadata
+                .get("related_suggestion_id")
+                .map(String::as_str),
+            Some(suggestion_id.as_str())
+        );
+        assert!(trace
+            .related_suggestion_ids
+            .iter()
+            .any(|related| related == &suggestion_id));
     }
 }

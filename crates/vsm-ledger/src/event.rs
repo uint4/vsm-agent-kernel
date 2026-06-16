@@ -21,6 +21,13 @@ pub enum LedgerEventKind {
     AuditCompleted,
     GeneSuggestionCreated,
     GenomePatchApplied,
+    TrialStarted,
+    TrialTaskRouted,
+    TrialTraceRecorded,
+    TrialDecisionRecorded,
+    TrialPromoted,
+    TrialPruned,
+    TrialRejected,
     Other(String),
 }
 
@@ -41,6 +48,13 @@ impl LedgerEventKind {
             Self::AuditCompleted => "audit_completed".to_string(),
             Self::GeneSuggestionCreated => "gene_suggestion_created".to_string(),
             Self::GenomePatchApplied => "genome_patch_applied".to_string(),
+            Self::TrialStarted => "trial_started".to_string(),
+            Self::TrialTaskRouted => "trial_task_routed".to_string(),
+            Self::TrialTraceRecorded => "trial_trace_recorded".to_string(),
+            Self::TrialDecisionRecorded => "trial_decision_recorded".to_string(),
+            Self::TrialPromoted => "trial_promoted".to_string(),
+            Self::TrialPruned => "trial_pruned".to_string(),
+            Self::TrialRejected => "trial_rejected".to_string(),
             Self::Other(value) => format!("other:{value}"),
         }
     }
@@ -78,16 +92,23 @@ impl LedgerEvent {
         })
     }
 
-    pub fn for_message(kind: LedgerEventKind, envelope: &MessageEnvelope) -> Result<Self, serde_json::Error> {
+    pub fn for_message(
+        kind: LedgerEventKind,
+        envelope: &MessageEnvelope,
+    ) -> Result<Self, serde_json::Error> {
         let mut event = Self::new(kind, envelope)?;
-        event.node_id = envelope.target_node_id.clone().or_else(|| envelope.source_node_id.clone());
+        event.node_id = envelope
+            .target_node_id
+            .clone()
+            .or_else(|| envelope.source_node_id.clone());
         event.correlation_id = envelope.correlation_id.clone();
         event
             .metadata
             .insert("payload_type".to_string(), envelope.payload_type.clone());
-        event
-            .metadata
-            .insert("channel_type".to_string(), format!("{:?}", envelope.channel_type));
+        event.metadata.insert(
+            "channel_type".to_string(),
+            format!("{:?}", envelope.channel_type),
+        );
         Ok(event)
     }
 

@@ -79,7 +79,8 @@ impl System3StarAuditor for RuleBasedSystem3StarAuditor {
             };
             findings.push(finding);
 
-            let mut reviewer = ViableNode::new_leaf("review-probation-leaf", LeafOperationSpec::reviewer());
+            let mut reviewer =
+                ViableNode::new_leaf("review-probation-leaf", LeafOperationSpec::reviewer());
             reviewer.system_5 = System5Policy {
                 identity: "Probationary review leaf suggested by System 3* audit.".to_string(),
                 values: vec!["catch regressions before integration".to_string()],
@@ -89,8 +90,12 @@ impl System3StarAuditor for RuleBasedSystem3StarAuditor {
                 denied_capabilities: vec!["write_code".to_string()],
             };
             reviewer.status = vsm_core::NodeLifecycleStatus::Probation;
-            reviewer.metadata.insert("suggested_by".to_string(), "system_3_star".to_string());
-            reviewer.metadata.insert("task_tag".to_string(), "review".to_string());
+            reviewer
+                .metadata
+                .insert("suggested_by".to_string(), "system_3_star".to_string());
+            reviewer
+                .metadata
+                .insert("task_tag".to_string(), "review".to_string());
 
             let patch = OrganizationalGenomePatch::AddChild {
                 parent_id: parent.id.clone(),

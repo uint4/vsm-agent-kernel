@@ -9,9 +9,11 @@ pub mod error;
 pub mod mapper;
 pub mod router;
 pub mod runtime;
+pub mod trial;
 
 pub use audit::*;
 pub use error::*;
 pub use mapper::*;
 pub use router::*;
 pub use runtime::*;
+pub use trial::*;

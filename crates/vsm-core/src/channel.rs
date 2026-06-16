@@ -120,16 +120,22 @@ impl ParentChildChannelBundle {
     pub fn standard(parent: NodeId, child: NodeId) -> Self {
         Self {
             resource_bargaining: Some(
-                ChannelConfig::new(VsmChannelType::ResourceBargaining, ChannelDirection::Bidirectional)
-                    .between(parent.clone(), child.clone()),
+                ChannelConfig::new(
+                    VsmChannelType::ResourceBargaining,
+                    ChannelDirection::Bidirectional,
+                )
+                .between(parent.clone(), child.clone()),
             ),
             command: Some(
                 ChannelConfig::new(VsmChannelType::Command, ChannelDirection::ParentToChild)
                     .between(parent.clone(), child.clone()),
             ),
             coordination_via_system2: Some(
-                ChannelConfig::new(VsmChannelType::System2Coordination, ChannelDirection::ParentToChild)
-                    .between(parent.clone(), child.clone()),
+                ChannelConfig::new(
+                    VsmChannelType::System2Coordination,
+                    ChannelDirection::ParentToChild,
+                )
+                .between(parent.clone(), child.clone()),
             ),
             audit_via_system3_star: Some(
                 ChannelConfig::new(VsmChannelType::Audit, ChannelDirection::Bidirectional)

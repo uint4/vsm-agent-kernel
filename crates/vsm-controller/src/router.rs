@@ -49,7 +49,11 @@ fn choose_direct_child(
     }
 
     if let Some(assigned_to) = &task.assigned_to {
-        if parent.children.iter().any(|child_id| child_id == assigned_to) {
+        if parent
+            .children
+            .iter()
+            .any(|child_id| child_id == assigned_to)
+        {
             return Ok(RoutingDecision {
                 child_id: assigned_to.clone(),
                 reason: "task already assigned to direct child".to_string(),

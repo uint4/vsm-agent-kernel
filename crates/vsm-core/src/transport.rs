@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use thiserror::Error;
 
-pub type EnvelopeStream = Pin<Box<dyn Stream<Item = Result<MessageEnvelope, TransportError>> + Send>>;
+pub type EnvelopeStream =
+    Pin<Box<dyn Stream<Item = Result<MessageEnvelope, TransportError>> + Send>>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
@@ -31,7 +32,8 @@ pub enum TransportError {
 pub trait Transport: Send + Sync {
     async fn publish(&self, envelope: MessageEnvelope) -> Result<(), TransportError>;
 
-    async fn subscribe(&self, subscription: Subscription) -> Result<EnvelopeStream, TransportError>;
+    async fn subscribe(&self, subscription: Subscription)
+        -> Result<EnvelopeStream, TransportError>;
 }
 
 pub trait ChannelRouter: Send + Sync {

@@ -2,8 +2,8 @@ use futures_util::StreamExt;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use vsm_core::{
-    envelope_for_task, BuiltinPayloadType, LeafOperationSpec, MessageEnvelope, OrganizationalGenome,
-    Subscription, TaskPacket, Transport, VsmChannelType, ViableNode,
+    envelope_for_task, BuiltinPayloadType, LeafOperationSpec, MessageEnvelope,
+    OrganizationalGenome, Subscription, TaskPacket, Transport, ViableNode, VsmChannelType,
 };
 use vsm_runtime::InMemoryTransport;
 use vsm_worker::{EchoModelProvider, InMemoryTraceSink, WorkerHarness};
@@ -16,7 +16,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut coder = ViableNode::new_leaf("primary-code-service", LeafOperationSpec::coding());
     coder.system_5.identity = "General coding leaf under the root VSM.".to_string();
-    coder.permissions.allowed_paths = vec!["src".to_string(), "crates".to_string(), "examples".to_string()];
+    coder.permissions.allowed_paths = vec![
+        "src".to_string(),
+        "crates".to_string(),
+        "examples".to_string(),
+    ];
     coder.model.provider = "echo".to_string();
     coder.model.model = "echo-local".to_string();
     let coder_id = genome.add_child(&root_id, coder)?;
@@ -50,16 +54,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Return a model-backed TaskResult and record a trace.",
     );
     task.assigned_to = Some(coder_id.clone());
-    task.metadata.insert("requires_code_write".to_string(), "true".to_string());
+    task.metadata
+        .insert("requires_code_write".to_string(), "true".to_string());
 
-    let envelope = envelope_for_task(&task)?.with_route(Some(root_id.clone()), Some(coder_id.clone()));
+    let envelope =
+        envelope_for_task(&task)?.with_route(Some(root_id.clone()), Some(coder_id.clone()));
     transport.publish(envelope).await?;
 
-    let result_envelope: MessageEnvelope = root_results
-        .next()
-        .await
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "root result stream closed"))??;
-    assert_eq!(result_envelope.payload_type, BuiltinPayloadType::TaskResult.as_str());
+    let result_envelope: MessageEnvelope = root_results.next().await.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "root result stream closed",
+        )
+    })??;
+    assert_eq!(
+        result_envelope.payload_type,
+        BuiltinPayloadType::TaskResult.as_str()
+    );
     println!("root received result: {}", result_envelope.payload);
 
     let handled = worker_task.await??;

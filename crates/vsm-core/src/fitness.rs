@@ -69,7 +69,8 @@ pub fn score_trace(trace: &TaskTrace, weights: &FitnessWeights) -> f64 {
 
     score -= trace.token_total() as f64 * weights.token_cost_weight;
     score -= trace.latency_ms as f64 * weights.latency_ms_weight;
-    score -= (trace.lines_added.unsigned_abs() + trace.lines_deleted.unsigned_abs()) as f64 * weights.line_delta_weight;
+    score -= (trace.lines_added.unsigned_abs() + trace.lines_deleted.unsigned_abs()) as f64
+        * weights.line_delta_weight;
 
     score
 }
@@ -84,25 +85,35 @@ pub fn summarize_direct_fitness<'a>(
     let mut summaries: BTreeMap<NodeId, FitnessSummary> = BTreeMap::new();
 
     for trace in traces {
-        let entry = summaries.entry(trace.assigned_node_id.clone()).or_insert_with(|| FitnessSummary {
-            node_id: trace.assigned_node_id.clone(),
-            task_count: 0,
-            merged_count: 0,
-            reverted_count: 0,
-            regression_count: 0,
-            human_override_count: 0,
-            tokens: 0,
-            latency_ms: 0,
-            raw_score: 0.0,
-            complexity_penalty: 0.0,
-            final_score: 0.0,
-        });
+        let entry = summaries
+            .entry(trace.assigned_node_id.clone())
+            .or_insert_with(|| FitnessSummary {
+                node_id: trace.assigned_node_id.clone(),
+                task_count: 0,
+                merged_count: 0,
+                reverted_count: 0,
+                regression_count: 0,
+                human_override_count: 0,
+                tokens: 0,
+                latency_ms: 0,
+                raw_score: 0.0,
+                complexity_penalty: 0.0,
+                final_score: 0.0,
+            });
 
         entry.task_count += 1;
         entry.merged_count += if trace.merged == Some(true) { 1 } else { 0 };
         entry.reverted_count += if trace.reverted == Some(true) { 1 } else { 0 };
-        entry.regression_count += if trace.post_merge_regression == Some(true) { 1 } else { 0 };
-        entry.human_override_count += if trace.human_override == Some(true) { 1 } else { 0 };
+        entry.regression_count += if trace.post_merge_regression == Some(true) {
+            1
+        } else {
+            0
+        };
+        entry.human_override_count += if trace.human_override == Some(true) {
+            1
+        } else {
+            0
+        };
         entry.tokens += trace.token_total();
         entry.latency_ms += trace.latency_ms;
         entry.raw_score += score_trace(trace, weights);

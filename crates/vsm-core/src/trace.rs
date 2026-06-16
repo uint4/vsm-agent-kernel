@@ -85,7 +85,12 @@ impl TaskTrace {
     }
 
     pub fn total_score(&self) -> f64 {
-        self.outcome_score + self.delayed_adjustments.iter().map(|a| a.delta_score).sum::<f64>()
+        self.outcome_score
+            + self
+                .delayed_adjustments
+                .iter()
+                .map(|a| a.delta_score)
+                .sum::<f64>()
     }
 
     pub fn token_total(&self) -> u64 {

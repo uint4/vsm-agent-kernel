@@ -90,7 +90,10 @@ impl GeneSuggestion {
                 window_tasks: Some(25),
                 window_days: None,
                 compare_against: CompareAgainst::CurrentParent,
-                success_metrics: vec!["accepted_task_value".to_string(), "regression_rate".to_string()],
+                success_metrics: vec![
+                    "accepted_task_value".to_string(),
+                    "regression_rate".to_string(),
+                ],
                 failure_metrics: vec!["token_cost".to_string(), "revert_rate".to_string()],
             },
             rollback_plan: RollbackPlan {

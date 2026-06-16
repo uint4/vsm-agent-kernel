@@ -60,7 +60,10 @@ impl<R> RabbitMqTransport<R>
 where
     R: ChannelRouter + 'static,
 {
-    pub async fn connect_with_router(config: RabbitMqConfig, router: R) -> Result<Self, RabbitTransportError> {
+    pub async fn connect_with_router(
+        config: RabbitMqConfig,
+        router: R,
+    ) -> Result<Self, RabbitTransportError> {
         let connection = Connection::connect(&config.uri, ConnectionProperties::default()).await?;
         let channel = connection.create_channel().await?;
 
@@ -114,7 +117,10 @@ where
         Ok(())
     }
 
-    async fn subscribe(&self, subscription: Subscription) -> Result<EnvelopeStream, TransportError> {
+    async fn subscribe(
+        &self,
+        subscription: Subscription,
+    ) -> Result<EnvelopeStream, TransportError> {
         let queue_name = subscription
             .queue_name
             .clone()
@@ -177,7 +183,10 @@ where
             }
         });
 
-        Ok(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<MessageEnvelope, TransportError>> + Send>>)
+        Ok(Box::pin(stream)
+            as Pin<
+                Box<dyn Stream<Item = Result<MessageEnvelope, TransportError>> + Send>,
+            >)
     }
 }
 

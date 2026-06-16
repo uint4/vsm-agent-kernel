@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use std::{pin::Pin, sync::Arc};
 use tokio::sync::broadcast;
-use vsm_core::{EnvelopeStream, MessageEnvelope, Subscription, Transport, TransportError, VsmChannelType};
+use vsm_core::{
+    EnvelopeStream, MessageEnvelope, Subscription, Transport, TransportError, VsmChannelType,
+};
 
 #[derive(Clone)]
 pub struct InMemoryTransport {
@@ -25,7 +27,10 @@ impl Transport for InMemoryTransport {
             .map_err(|e| TransportError::Operation(e.to_string()))
     }
 
-    async fn subscribe(&self, subscription: Subscription) -> Result<EnvelopeStream, TransportError> {
+    async fn subscribe(
+        &self,
+        subscription: Subscription,
+    ) -> Result<EnvelopeStream, TransportError> {
         let mut receiver = self.sender.subscribe();
         let subscription = Arc::new(subscription);
 
@@ -42,7 +47,10 @@ impl Transport for InMemoryTransport {
             }
         };
 
-        Ok(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<MessageEnvelope, TransportError>> + Send>>)
+        Ok(Box::pin(stream)
+            as Pin<
+                Box<dyn Stream<Item = Result<MessageEnvelope, TransportError>> + Send>,
+            >)
     }
 }
 

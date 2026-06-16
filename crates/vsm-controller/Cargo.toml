@@ -14,7 +14,7 @@ thiserror.workspace = true
 tokio.workspace = true
 vsm-core = { path = "../vsm-core" }
 vsm-ledger = { path = "../vsm-ledger" }
+vsm-runtime = { path = "../vsm-runtime" }
 
 [dev-dependencies]
-vsm-runtime = { path = "../vsm-runtime" }
 vsm-worker = { path = "../vsm-worker" }

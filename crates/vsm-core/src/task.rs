@@ -171,7 +171,11 @@ pub struct Directive {
 }
 
 impl Directive {
-    pub fn new(origin: impl Into<String>, title: impl Into<String>, body: impl Into<String>) -> Self {
+    pub fn new(
+        origin: impl Into<String>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
         Self {
             id: DirectiveId::new(),
             origin: origin.into(),

@@ -24,7 +24,10 @@ pub trait Ledger: Send + Sync {
             .into_iter()
             .filter(|trace| {
                 &trace.assigned_node_id == node_id
-                    || trace.responsible_ancestor_ids.iter().any(|ancestor| ancestor == node_id)
+                    || trace
+                        .responsible_ancestor_ids
+                        .iter()
+                        .any(|ancestor| ancestor == node_id)
             })
             .collect())
     }

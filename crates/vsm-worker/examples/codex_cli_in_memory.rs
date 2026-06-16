@@ -2,8 +2,8 @@ use futures_util::StreamExt;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use vsm_core::{
-    envelope_for_task, BuiltinPayloadType, LeafOperationSpec, MessageEnvelope, OrganizationalGenome,
-    Subscription, TaskPacket, Transport, VsmChannelType, ViableNode,
+    envelope_for_task, BuiltinPayloadType, LeafOperationSpec, MessageEnvelope,
+    OrganizationalGenome, Subscription, TaskPacket, Transport, ViableNode, VsmChannelType,
 };
 use vsm_runtime::InMemoryTransport;
 use vsm_worker::{
@@ -70,16 +70,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Do not add production dependencies.".to_string(),
         "Keep the diff small.".to_string(),
     ];
-    task.metadata.insert("requires_code_write".to_string(), "true".to_string());
+    task.metadata
+        .insert("requires_code_write".to_string(), "true".to_string());
 
     let envelope = envelope_for_task(&task)?.with_route(Some(root_id.clone()), Some(coder_id));
     transport.publish(envelope).await?;
 
-    let result_envelope: MessageEnvelope = root_results
-        .next()
-        .await
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "root result stream closed"))??;
-    assert_eq!(result_envelope.payload_type, BuiltinPayloadType::TaskResult.as_str());
+    let result_envelope: MessageEnvelope = root_results.next().await.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "root result stream closed",
+        )
+    })??;
+    assert_eq!(
+        result_envelope.payload_type,
+        BuiltinPayloadType::TaskResult.as_str()
+    );
     println!("root received result: {}", result_envelope.payload);
 
     let handled = worker_task.await??;

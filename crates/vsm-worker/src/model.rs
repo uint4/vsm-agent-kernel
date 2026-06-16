@@ -61,7 +61,8 @@ impl ModelProvider for EchoModelProvider {
 
         Ok(ModelResponse {
             usage: Some(ModelUsage {
-                input_tokens: rough_token_estimate(&request.instructions) + rough_token_estimate(&request.input),
+                input_tokens: rough_token_estimate(&request.instructions)
+                    + rough_token_estimate(&request.input),
                 output_tokens: rough_token_estimate(&output_text),
             }),
             output_text,

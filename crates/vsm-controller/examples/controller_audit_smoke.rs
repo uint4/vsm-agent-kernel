@@ -34,12 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let genome = Arc::new(RwLock::new(genome));
     let transport = Arc::new(InMemoryTransport::new(16));
 
-    let controller = ControllerRuntime::new(
-        root_id.clone(),
-        genome,
-        transport,
-        ledger.clone(),
-    );
+    let controller = ControllerRuntime::new(root_id.clone(), genome, transport, ledger.clone());
 
     let auditor = RuleBasedSystem3StarAuditor::default();
     let report = controller.run_system_3_star_audit(&auditor).await?;

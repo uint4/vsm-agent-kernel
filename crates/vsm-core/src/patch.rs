@@ -1,6 +1,6 @@
 use crate::{
-    ChannelConfig, ContextPolicy, GenomeError, ModelSpec, MutationId, NodeId, OrganizationalGenome,
-    PermissionSpec, PromptComponent, PromptGenome, ToolSpec, ViableNode, LeafOperationSpec,
+    ChannelConfig, ContextPolicy, GenomeError, LeafOperationSpec, ModelSpec, MutationId, NodeId,
+    OrganizationalGenome, PermissionSpec, PromptComponent, PromptGenome, ToolSpec, ViableNode,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -88,7 +88,10 @@ impl OrganizationalGenomePatch {
             Self::AddChild { parent_id, child } => {
                 genome.add_child(parent_id, child.clone())?;
             }
-            Self::PromoteLeafToMetasystem { node_id, extracted_child_name } => {
+            Self::PromoteLeafToMetasystem {
+                node_id,
+                extracted_child_name,
+            } => {
                 let (
                     leaf_operation,
                     model,
@@ -147,19 +150,36 @@ impl OrganizationalGenomePatch {
                 genome.channels.push(channel.clone());
             }
             Self::RemoveChannel { channel_id } => {
-                genome.channels.retain(|ch| ch.id.as_str() != channel_id.as_str());
+                genome
+                    .channels
+                    .retain(|ch| ch.id.as_str() != channel_id.as_str());
             }
-            Self::AddPromptComponent { node_id, section, component } => {
+            Self::AddPromptComponent {
+                node_id,
+                section,
+                component,
+            } => {
                 let node = genome.get_node_mut(node_id)?;
                 match section {
-                    PromptSection::BehaviorRules => node.prompt.behavior_rules.push(component.clone()),
+                    PromptSection::BehaviorRules => {
+                        node.prompt.behavior_rules.push(component.clone())
+                    }
                     PromptSection::DomainHints => node.prompt.domain_hints.push(component.clone()),
-                    PromptSection::CodebaseConventions => node.prompt.codebase_conventions.push(component.clone()),
-                    PromptSection::NegativeConstraints => node.prompt.negative_constraints.push(component.clone()),
-                    PromptSection::OutputContract => node.prompt.output_contract = Some(component.clone()),
+                    PromptSection::CodebaseConventions => {
+                        node.prompt.codebase_conventions.push(component.clone())
+                    }
+                    PromptSection::NegativeConstraints => {
+                        node.prompt.negative_constraints.push(component.clone())
+                    }
+                    PromptSection::OutputContract => {
+                        node.prompt.output_contract = Some(component.clone())
+                    }
                 }
             }
-            Self::RemovePromptComponent { node_id, component_id } => {
+            Self::RemovePromptComponent {
+                node_id,
+                component_id,
+            } => {
                 let node = genome.get_node_mut(node_id)?;
                 let mut removed = false;
                 for section in [
@@ -184,7 +204,10 @@ impl OrganizationalGenomePatch {
                 genome.get_node_mut(node_id)?.tools.push(tool.clone());
             }
             Self::RemoveTool { node_id, tool_name } => {
-                genome.get_node_mut(node_id)?.tools.retain(|t| t.name != *tool_name);
+                genome
+                    .get_node_mut(node_id)?
+                    .tools
+                    .retain(|t| t.name != *tool_name);
             }
             Self::SetNodeStatus { node_id, status } => {
                 genome.get_node_mut(node_id)?.status = status.clone();

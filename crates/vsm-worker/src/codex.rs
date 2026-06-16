@@ -15,11 +15,11 @@ impl OpenAiCodexConfig {
         let api_key = env::var("OPENAI_API_KEY")
             .map_err(|_| ModelProviderError::MissingConfig("OPENAI_API_KEY".to_string()))?;
 
-        let base_url = env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+        let base_url =
+            env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-        let default_model = env::var("OPENAI_CODEX_MODEL")
-            .unwrap_or_else(|_| "gpt-5.5".to_string());
+        let default_model =
+            env::var("OPENAI_CODEX_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
 
         Ok(Self {
             api_key,
@@ -67,7 +67,12 @@ impl ModelProvider for OpenAiCodexProvider {
             "input": request.input,
         });
 
-        if let Some(effort) = request.model.effort.as_ref().filter(|s| !s.trim().is_empty()) {
+        if let Some(effort) = request
+            .model
+            .effort
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+        {
             body.as_object_mut()
                 .expect("json object")
                 .insert("reasoning".to_string(), json!({ "effort": effort }));
@@ -140,8 +145,14 @@ fn extract_output_text(raw: &Value) -> Option<String> {
 fn extract_usage(raw: &Value) -> Option<ModelUsage> {
     let usage = raw.get("usage")?;
     Some(ModelUsage {
-        input_tokens: usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-        output_tokens: usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     })
 }
 
@@ -191,7 +202,9 @@ impl CodexCliConfig {
         Self {
             binary: std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".to_string()),
             workspace_root,
-            model: std::env::var("CODEX_MODEL").ok().or_else(|| std::env::var("OPENAI_CODEX_MODEL").ok()),
+            model: std::env::var("CODEX_MODEL")
+                .ok()
+                .or_else(|| std::env::var("OPENAI_CODEX_MODEL").ok()),
             profile: std::env::var("CODEX_PROFILE").ok(),
             sandbox: std::env::var("CODEX_SANDBOX")
                 .ok()
@@ -294,7 +307,10 @@ impl ModelProvider for CodexCliProvider {
 }
 
 impl CodexCliProvider {
-    fn complete_blocking(&self, request: ModelRequest) -> Result<ModelResponse, ModelProviderError> {
+    fn complete_blocking(
+        &self,
+        request: ModelRequest,
+    ) -> Result<ModelResponse, ModelProviderError> {
         let prompt = render_codex_prompt(&request);
         let fallback_input_tokens = crate::rough_token_estimate(&prompt);
 
@@ -341,14 +357,14 @@ impl CodexCliProvider {
             .map_err(|e| ModelProviderError::Request(format!("failed to spawn codex CLI: {e}")))?;
 
         if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(prompt.as_bytes())
-                .map_err(|e| ModelProviderError::Request(format!("failed to write codex prompt: {e}")))?;
+            stdin.write_all(prompt.as_bytes()).map_err(|e| {
+                ModelProviderError::Request(format!("failed to write codex prompt: {e}"))
+            })?;
         }
 
-        let output = child
-            .wait_with_output()
-            .map_err(|e| ModelProviderError::Request(format!("failed to wait for codex CLI: {e}")))?;
+        let output = child.wait_with_output().map_err(|e| {
+            ModelProviderError::Request(format!("failed to wait for codex CLI: {e}"))
+        })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -436,17 +452,20 @@ fn parse_codex_jsonl(stdout: &str) -> CodexJsonlSummary {
         };
 
         summary.event_count += 1;
-        let event_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
 
         match event_type {
             "turn.completed" => {
                 if let Some(usage) = value.get("usage") {
                     summary.input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
-                    summary.cached_input_tokens = usage.get("cached_input_tokens").and_then(Value::as_u64);
+                    summary.cached_input_tokens =
+                        usage.get("cached_input_tokens").and_then(Value::as_u64);
                     summary.output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
-                    summary.reasoning_output_tokens = usage
-                        .get("reasoning_output_tokens")
-                        .and_then(Value::as_u64);
+                    summary.reasoning_output_tokens =
+                        usage.get("reasoning_output_tokens").and_then(Value::as_u64);
                 }
             }
             "turn.failed" | "error" => {
@@ -465,7 +484,10 @@ fn parse_codex_jsonl(stdout: &str) -> CodexJsonlSummary {
                             }
                         }
                         other => {
-                            if other.contains("file") || other.contains("patch") || other.contains("change") {
+                            if other.contains("file")
+                                || other.contains("patch")
+                                || other.contains("change")
+                            {
                                 summary.artifacts.push(item.to_string());
                                 collect_file_paths(item, &mut summary.files_touched);
                             }

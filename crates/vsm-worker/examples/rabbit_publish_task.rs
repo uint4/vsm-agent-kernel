@@ -4,8 +4,12 @@ use vsm_core::{envelope_for_task, NodeId, TaskPacket, Transport};
 
 #[tokio::main]
 async fn main() -> anyhow_free::Result<()> {
-    let root_id = NodeId::from_string(env::var("VSM_ROOT_NODE_ID").unwrap_or_else(|_| "root-controller".to_string()));
-    let worker_id = NodeId::from_string(env::var("VSM_WORKER_NODE_ID").unwrap_or_else(|_| "primary-code-service".to_string()));
+    let root_id = NodeId::from_string(
+        env::var("VSM_ROOT_NODE_ID").unwrap_or_else(|_| "root-controller".to_string()),
+    );
+    let worker_id = NodeId::from_string(
+        env::var("VSM_WORKER_NODE_ID").unwrap_or_else(|_| "primary-code-service".to_string()),
+    );
 
     let mut rabbit_config = RabbitMqConfig::local_default();
     if let Ok(uri) = env::var("RABBITMQ_URI") {

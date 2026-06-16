@@ -1,5 +1,8 @@
 use std::sync::Arc;
-use tokio::{sync::RwLock, time::{sleep, Duration}};
+use tokio::{
+    sync::RwLock,
+    time::{sleep, Duration},
+};
 use vsm_core::{
     envelope_for_task, LeafOperationSpec, ModelSpec, OrganizationalGenome, TaskPacket, Transport,
     ViableNode,
@@ -12,7 +15,8 @@ async fn main() -> anyhow_free::Result<()> {
     let mut root = ViableNode::new_metasystem("root-controller");
     root.system_5.identity = "Autonomous coding organization root".to_string();
 
-    let mut code_service = ViableNode::new_leaf("primary-code-service", LeafOperationSpec::coding());
+    let mut code_service =
+        ViableNode::new_leaf("primary-code-service", LeafOperationSpec::coding());
     code_service.system_5.identity = "Generalist coding leaf".to_string();
     code_service.model = ModelSpec {
         provider: "echo".to_string(),

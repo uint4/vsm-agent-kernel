@@ -22,8 +22,10 @@ impl DirectiveTaskMapper {
         task.risk = directive.risk.clone();
         task.metadata
             .insert("origin".to_string(), directive.origin.clone());
-        task.metadata
-            .insert("mapped_from_directive".to_string(), directive.id.to_string());
+        task.metadata.insert(
+            "mapped_from_directive".to_string(),
+            directive.id.to_string(),
+        );
 
         let requires_code_write = directive
             .metadata
@@ -36,7 +38,14 @@ impl DirectiveTaskMapper {
             requires_code_write.to_string(),
         );
 
-        for key in ["required_capability", "target_child", "requires_review"] {
+        for key in [
+            "required_capability",
+            "target_child",
+            "requires_review",
+            "trial_approved",
+            "task_class",
+            "estimated_files_touched",
+        ] {
             if let Some(value) = directive.metadata.get(key) {
                 task.metadata.insert(key.to_string(), value.clone());
             }

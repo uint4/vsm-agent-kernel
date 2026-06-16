@@ -17,7 +17,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut coder = ViableNode::new_leaf("primary-code-service", LeafOperationSpec::coding());
     coder.system_5.identity = "General coding leaf under the root VSM.".to_string();
-    coder.permissions.allowed_paths = vec!["src".to_string(), "crates".to_string(), "examples".to_string()];
+    coder.permissions.allowed_paths = vec![
+        "src".to_string(),
+        "crates".to_string(),
+        "examples".to_string(),
+    ];
     coder.model.provider = "echo".to_string();
     coder.model.model = "echo-local".to_string();
     let coder_id = genome.add_child(&root_id, coder)?;
