@@ -5,11 +5,13 @@ members = [
     "crates/vsm-runtime",
     "crates/vsm-amqp",
     "crates/vsm-worker",
+    "crates/vsm-controller",
+    "crates/vsm-ledger",
 ]
 
 [workspace.package]
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0"
 rust-version = "1.78"
 
 [workspace.dependencies]
@@ -25,3 +27,6 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 # Model-provider adapters
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Durable local ledger
+rusqlite = { version = "0.31", features = ["bundled"] }

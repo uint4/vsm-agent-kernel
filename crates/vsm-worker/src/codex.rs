@@ -305,8 +305,8 @@ impl CodexCliProvider {
             .arg(&self.config.workspace_root)
             .arg("--sandbox")
             .arg(self.config.sandbox.as_arg())
-            // .arg("--ask-for-approval")
-            // .arg(self.config.approval.as_arg())
+            .arg("--ask-for-approval")
+            .arg(self.config.approval.as_arg())
             .arg("--color")
             .arg("never");
 
