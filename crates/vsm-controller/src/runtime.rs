@@ -621,6 +621,9 @@ impl ControllerRuntime {
                     .with_directive(directive.id.clone());
                 self.ledger.append_event(event).await?;
 
+                self.log_task_mapped(&task, Some(&directive), &envelope, "system3_single_task")
+                    .await?;
+
                 let route = self.route_task(task, Some(&envelope)).await?;
                 Ok(ControllerHandleOutcome::RoutedTask {
                     task: route.task,
@@ -630,6 +633,10 @@ impl ControllerRuntime {
             }
             payload if payload == BuiltinPayloadType::TaskPacket.as_str() => {
                 let task: TaskPacket = envelope.payload_as()?;
+                if task.parent_task_id.is_some() || !task.dependencies.is_empty() {
+                    self.log_task_mapped(&task, None, &envelope, "system3_channel_task")
+                        .await?;
+                }
                 let route = self.route_task(task, Some(&envelope)).await?;
                 Ok(ControllerHandleOutcome::RoutedTask {
                     task: route.task,
@@ -657,6 +664,48 @@ impl ControllerRuntime {
             }
             _ => Ok(ControllerHandleOutcome::Ignored),
         }
+    }
+
+    async fn log_task_mapped(
+        &self,
+        task: &TaskPacket,
+        directive: Option<&Directive>,
+        envelope: &MessageEnvelope,
+        decomposition_policy: &str,
+    ) -> Result<(), ControllerError> {
+        let payload = serde_json::json!({
+            "controller_node_id": self.node_id.to_string(),
+            "task_id": task.id.to_string(),
+            "task_title": task.title.clone(),
+            "directive_id": task.directive_id.as_ref().map(ToString::to_string),
+            "parent_task_id": task.parent_task_id.as_ref().map(ToString::to_string),
+            "dependency_task_ids": task.dependencies.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "decomposition_policy": decomposition_policy,
+            "decomposition_authority": task
+                .metadata
+                .get("decomposition_authority")
+                .cloned()
+                .unwrap_or_else(|| "system3".to_string()),
+            "source_channel": format!("{:?}", envelope.channel_type),
+            "source_payload_type": envelope.payload_type.clone(),
+            "causation_id": envelope.causation_id.as_ref().map(ToString::to_string),
+            "correlation_id": envelope.correlation_id.clone(),
+            "directive_title": directive.map(|directive| directive.title.clone()),
+            "target_state": task.target_state.clone(),
+            "risk": format!("{:?}", task.risk),
+            "metadata": task.metadata.clone(),
+        });
+        let mut event = LedgerEvent::new(LedgerEventKind::TaskMapped, payload)?
+            .with_node(self.node_id.clone())
+            .with_task(task.id.clone());
+        if let Some(directive_id) = task.directive_id.clone() {
+            event = event.with_directive(directive_id);
+        }
+        if let Some(correlation_id) = envelope.correlation_id.clone() {
+            event = event.with_correlation(correlation_id);
+        }
+        self.ledger.append_event(event).await?;
+        Ok(())
     }
 
     async fn route_task(
@@ -806,19 +855,27 @@ impl ControllerRuntime {
                 .unwrap_or_else(|_| "unknown".to_string())
         };
 
-        let event = LedgerEvent::new(
+        let mut event = LedgerEvent::new(
             LedgerEventKind::TaskRouted,
             &TaskRoutedPayload {
                 parent_node_id: self.node_id.clone(),
                 child_node_id: child_id.clone(),
                 task_id: task.id.clone(),
                 task_title: task.title.clone(),
+                directive_id: task.directive_id.as_ref().map(ToString::to_string),
+                parent_task_id: task.parent_task_id.as_ref().map(ToString::to_string),
+                dependency_task_ids: task.dependencies.iter().map(ToString::to_string).collect(),
                 reason: reason.clone(),
                 parent_name,
                 is_trial_route,
                 is_shadow_route,
                 suggestion_id: suggestion_id.as_ref().map(ToString::to_string),
                 routed_genome_id: genome_id.to_string(),
+                source_channel: incoming.map(|incoming| format!("{:?}", incoming.channel_type)),
+                causation_id: incoming
+                    .and_then(|incoming| incoming.causation_id.as_ref())
+                    .map(ToString::to_string),
+                correlation_id: incoming.and_then(|incoming| incoming.correlation_id.clone()),
                 trial_mode: task.metadata.get("trial_mode").cloned(),
                 trial_exposure_basis_points: task
                     .metadata
@@ -831,6 +888,9 @@ impl ControllerRuntime {
         .with_genome(genome_id.clone())
         .with_node(self.node_id.clone())
         .with_task(task.id.clone());
+        if let Some(directive_id) = task.directive_id.clone() {
+            event = event.with_directive(directive_id);
+        }
         self.ledger.append_event(event).await?;
 
         if is_trial_route {
@@ -1120,12 +1180,18 @@ struct TaskRoutedPayload {
     child_node_id: NodeId,
     task_id: vsm_core::TaskId,
     task_title: String,
+    directive_id: Option<String>,
+    parent_task_id: Option<String>,
+    dependency_task_ids: Vec<String>,
     reason: String,
     parent_name: String,
     is_trial_route: bool,
     is_shadow_route: bool,
     suggestion_id: Option<String>,
     routed_genome_id: String,
+    source_channel: Option<String>,
+    causation_id: Option<String>,
+    correlation_id: Option<String>,
     trial_mode: Option<String>,
     trial_exposure_basis_points: Option<String>,
     trial_exposure_bucket: Option<String>,
@@ -1178,9 +1244,9 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::RwLock;
     use vsm_core::{
-        GeneSuggestionSource, GenomeId, LeafOperationSpec, OrganizationalGenome,
-        OrganizationalGenomePatch, Subscription, System5Policy, TaskId, TaskTrace, Transport,
-        TrialMode, ViableNode,
+        envelope_for_directive, envelope_for_task, Directive, GeneSuggestionSource, GenomeId,
+        LeafOperationSpec, OrganizationalGenome, OrganizationalGenomePatch, Subscription,
+        System5Policy, TaskId, TaskPacket, TaskTrace, Transport, TrialMode, ViableNode,
     };
     use vsm_ledger::{InMemoryLedger, StoredTrialRecord, StoredTrialStatus};
     use vsm_runtime::InMemoryTransport;
@@ -1225,6 +1291,167 @@ mod tests {
         let ledger: Arc<dyn Ledger> = ledger;
         let controller = ControllerRuntime::new(root_id, shared_genome.clone(), transport, ledger);
         (controller, shared_genome)
+    }
+
+    #[tokio::test]
+    async fn directive_mapping_records_task_mapped_and_routed_lineage() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let _keepalive = transport
+            .subscribe(Subscription {
+                channel_types: vec![],
+                target_node_id: None,
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+        let mut directive = Directive::new("user", "Implement feature", "make the change");
+        directive.desired_state = Some("feature implemented".to_string());
+        directive.metadata.insert(
+            "task.metadata.decomposition_authority".to_string(),
+            "system3_model".to_string(),
+        );
+        let envelope = envelope_for_directive(&directive)
+            .expect("directive envelope")
+            .with_route(None, Some(root_id.clone()));
+
+        let outcome = controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle directive");
+        let ControllerHandleOutcome::RoutedTask { task, .. } = outcome else {
+            panic!("expected routed task");
+        };
+        assert_eq!(task.directive_id, Some(directive.id.clone()));
+
+        let mapped = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskMapped],
+                directive_id: Some(directive.id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("mapped events");
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].task_id, Some(task.id.clone()));
+        assert_eq!(
+            mapped[0].payload["decomposition_authority"].as_str(),
+            Some("system3_model")
+        );
+        assert_eq!(
+            mapped[0].payload["source_channel"].as_str(),
+            Some("OperationToEnvironment")
+        );
+
+        let routed = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskRouted],
+                directive_id: Some(directive.id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("routed events");
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].task_id, Some(task.id.clone()));
+        assert_eq!(
+            routed[0].payload["directive_id"].as_str(),
+            Some(directive.id.as_str())
+        );
+        assert!(routed[0].payload["dependency_task_ids"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+    }
+
+    #[tokio::test]
+    async fn task_packet_lineage_is_recorded_from_channel_traffic() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let _keepalive = transport
+            .subscribe(Subscription {
+                channel_types: vec![],
+                target_node_id: None,
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+        let parent_task_id = TaskId::new();
+        let dependency_id = TaskId::new();
+        let mut task = TaskPacket::new("Child task", "continue decomposed work");
+        task.parent_task_id = Some(parent_task_id.clone());
+        task.dependencies.push(dependency_id.clone());
+        task.metadata
+            .insert("requires_code_write".to_string(), "true".to_string());
+        let envelope = envelope_for_task(&task)
+            .expect("task envelope")
+            .with_route(None, Some(root_id.clone()));
+
+        controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle task");
+
+        let mapped = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskMapped],
+                task_id: Some(task.id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("mapped events");
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(
+            mapped[0].payload["parent_task_id"].as_str(),
+            Some(parent_task_id.as_str())
+        );
+        assert_eq!(
+            mapped[0].payload["dependency_task_ids"][0].as_str(),
+            Some(dependency_id.as_str())
+        );
+
+        let routed = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskRouted],
+                task_id: Some(task.id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("routed events");
+        assert_eq!(
+            routed[0].payload["parent_task_id"].as_str(),
+            Some(parent_task_id.as_str())
+        );
+        assert_eq!(
+            routed[0].payload["dependency_task_ids"][0].as_str(),
+            Some(dependency_id.as_str())
+        );
+        assert_eq!(
+            routed[0].payload["source_channel"].as_str(),
+            Some("ResourceBargaining")
+        );
     }
 
     #[tokio::test]

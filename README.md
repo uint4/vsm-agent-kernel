@@ -153,6 +153,7 @@ The ledger stores:
 
 - messages received and published
 - directives accepted
+- task mapping lineage
 - tasks routed
 - task results received
 - task traces written
@@ -169,7 +170,7 @@ Implementations:
 - `InMemoryLedger`
 - `SqliteLedger`
 
-The default subtree trace query uses `assigned_node_id` plus `responsible_ancestor_ids`. `vsm-core` also exposes minimum viable attributed fitness summaries: direct workers receive direct credit/blame, the immediate responsible parent receives subtree credit/blame, and higher ancestors receive decayed credit/blame. SQLite and in-memory ledgers also persist enough genome/trial state for controller restart recovery and queued candidate activation.
+The default subtree trace query uses `assigned_node_id` plus `responsible_ancestor_ids`. Task mapping and routing events carry directive IDs, parent task IDs, dependency IDs, source channel metadata, and correlation/causation IDs so decomposition views can be derived from VSM channel traffic instead of stored as a separate authoritative graph. `vsm-core` also exposes minimum viable attributed fitness summaries: direct workers receive direct credit/blame, the immediate responsible parent receives subtree credit/blame, and higher ancestors receive decayed credit/blame. SQLite and in-memory ledgers also persist enough genome/trial state for controller restart recovery and queued candidate activation.
 
 ## Controller
 
