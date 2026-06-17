@@ -982,6 +982,11 @@ impl ControllerRuntime {
                                 "title": command.title,
                                 "non_negotiable": command.non_negotiable,
                                 "legal_or_policy_basis": command.legal_or_policy_basis,
+                                "system5_identity": command.system5_identity,
+                                "policy_values": command.policy_values,
+                                "non_negotiable_constraints": command.non_negotiable_constraints,
+                                "denied_capabilities": command.denied_capabilities,
+                                "metadata": command.metadata,
                                 "source_channel": format!("{:?}", envelope.channel_type),
                                 "correlation_id": envelope.correlation_id,
                                 "causation_id": envelope.causation_id.as_ref().map(ToString::to_string),
@@ -2826,6 +2831,23 @@ impl ControllerRuntime {
                     .cloned(),
                 coordination_severity: task.metadata.get("coordination_severity").cloned(),
                 coordination_policy: task.metadata.get("coordination_policy").cloned(),
+                command_issued_by: task.metadata.get("command_issued_by").cloned(),
+                command_target_node_id: task.metadata.get("command_target_node_id").cloned(),
+                command_non_negotiable: task.metadata.get("command_non_negotiable").cloned(),
+                command_legal_or_policy_basis: task
+                    .metadata
+                    .get("command_legal_or_policy_basis")
+                    .cloned(),
+                command_system5_identity: task.metadata.get("command_system5_identity").cloned(),
+                command_policy_values: task.metadata.get("command_policy_values").cloned(),
+                command_policy_constraints: task
+                    .metadata
+                    .get("command_policy_constraints")
+                    .cloned(),
+                command_denied_capabilities: task
+                    .metadata
+                    .get("command_denied_capabilities")
+                    .cloned(),
             },
         )?
         .with_genome(genome_id.clone())
@@ -3233,6 +3255,14 @@ struct TaskRoutedPayload {
     coordination_target_node_id: Option<String>,
     coordination_severity: Option<String>,
     coordination_policy: Option<String>,
+    command_issued_by: Option<String>,
+    command_target_node_id: Option<String>,
+    command_non_negotiable: Option<String>,
+    command_legal_or_policy_basis: Option<String>,
+    command_system5_identity: Option<String>,
+    command_policy_values: Option<String>,
+    command_policy_constraints: Option<String>,
+    command_denied_capabilities: Option<String>,
 }
 
 fn result_is_shadow_trial(result: &TaskResult) -> bool {
@@ -3251,7 +3281,10 @@ fn result_is_shadow_trial(result: &TaskResult) -> bool {
 fn task_from_command(command: &VsmCommand) -> TaskPacket {
     let mut task = TaskPacket::new(command.title.clone(), command.body.clone());
     task.assigned_to = Some(command.target.clone());
-    task.risk = if command.legal_or_policy_basis.is_some() {
+    task.risk = if command.legal_or_policy_basis.is_some()
+        || !command.non_negotiable_constraints.is_empty()
+        || !command.denied_capabilities.is_empty()
+    {
         RiskClass::Critical
     } else if command.non_negotiable {
         RiskClass::High
@@ -3267,6 +3300,50 @@ fn task_from_command(command: &VsmCommand) -> TaskPacket {
         task.authority_refs.push(basis.clone());
         task.metadata
             .insert("legal_or_policy_basis".to_string(), basis.clone());
+        task.metadata
+            .insert("command_legal_or_policy_basis".to_string(), basis.clone());
+    }
+    if let Some(identity) = &command.system5_identity {
+        task.constraints
+            .push(format!("system5 identity: {identity}"));
+        task.metadata
+            .insert("command_system5_identity".to_string(), identity.clone());
+    }
+    for value in &command.policy_values {
+        task.constraints.push(format!("policy value: {value}"));
+    }
+    if !command.policy_values.is_empty() {
+        task.metadata.insert(
+            "command_policy_values".to_string(),
+            command.policy_values.join("|"),
+        );
+    }
+    for constraint in &command.non_negotiable_constraints {
+        task.constraints
+            .push(format!("non-negotiable policy constraint: {constraint}"));
+    }
+    if !command.non_negotiable_constraints.is_empty() {
+        task.metadata.insert(
+            "command_policy_constraints".to_string(),
+            command.non_negotiable_constraints.join("|"),
+        );
+    }
+    for capability in &command.denied_capabilities {
+        task.constraints
+            .push(format!("denied capability: {capability}"));
+    }
+    if !command.denied_capabilities.is_empty() {
+        task.metadata.insert(
+            "command_denied_capabilities".to_string(),
+            command.denied_capabilities.join("|"),
+        );
+    }
+    for (key, value) in &command.metadata {
+        if key == "required_capability" || key == "requires_code_write" || key == "target_child" {
+            task.metadata.insert(key.clone(), value.clone());
+        }
+        task.metadata
+            .insert(format!("command_metadata.{key}"), value.clone());
     }
 
     task.metadata
@@ -3278,6 +3355,10 @@ fn task_from_command(command: &VsmCommand) -> TaskPacket {
     task.metadata.insert(
         "command_non_negotiable".to_string(),
         command.non_negotiable.to_string(),
+    );
+    task.metadata.insert(
+        "command_target_node_id".to_string(),
+        command.target.to_string(),
     );
     task
 }
@@ -5256,6 +5337,17 @@ const COORDINATION_METADATA_KEYS: &[&str] = &[
     "coordination_affected_task_ids",
 ];
 
+const COMMAND_METADATA_KEYS: &[&str] = &[
+    "command_issued_by",
+    "command_target_node_id",
+    "command_non_negotiable",
+    "command_legal_or_policy_basis",
+    "command_system5_identity",
+    "command_policy_values",
+    "command_policy_constraints",
+    "command_denied_capabilities",
+];
+
 fn annotate_incoming_task_channel(
     task: &mut TaskPacket,
     incoming: Option<&MessageEnvelope>,
@@ -5386,6 +5478,11 @@ fn copy_channel_metadata_to_envelope(task: &TaskPacket, envelope: &mut MessageEn
         }
     }
     for key in COORDINATION_METADATA_KEYS {
+        if let Some(value) = task.metadata.get(*key) {
+            envelope.metadata.insert((*key).to_string(), value.clone());
+        }
+    }
+    for key in COMMAND_METADATA_KEYS {
         if let Some(value) = task.metadata.get(*key) {
             envelope.metadata.insert((*key).to_string(), value.clone());
         }
@@ -6277,6 +6374,11 @@ mod tests {
             body: "Do not deploy this build until the policy review passes.".to_string(),
             non_negotiable: true,
             legal_or_policy_basis: Some("release-policy".to_string()),
+            system5_identity: Some("Release safety policy".to_string()),
+            policy_values: vec!["protect production stability".to_string()],
+            non_negotiable_constraints: vec!["deployment must remain frozen".to_string()],
+            denied_capabilities: vec!["deploy".to_string()],
+            metadata: BTreeMap::from([("policy_version".to_string(), "2026.06".to_string())]),
         };
         let envelope = MessageEnvelope::new(
             VsmChannelType::Command,
@@ -6306,6 +6408,28 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+        assert_eq!(
+            task.metadata
+                .get("command_system5_identity")
+                .map(String::as_str),
+            Some("Release safety policy")
+        );
+        assert_eq!(
+            task.metadata
+                .get("command_policy_constraints")
+                .map(String::as_str),
+            Some("deployment must remain frozen")
+        );
+        assert!(task
+            .constraints
+            .iter()
+            .any(|constraint| constraint.contains("deployment must remain frozen")));
+        assert_eq!(
+            task.metadata
+                .get("command_denied_capabilities")
+                .map(String::as_str),
+            Some("deploy")
+        );
 
         let published =
             tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
@@ -6321,6 +6445,20 @@ mod tests {
                 .get("vsm_outbound_channel")
                 .map(String::as_str),
             Some("Command")
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("command_system5_identity")
+                .map(String::as_str),
+            Some("Release safety policy")
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("command_denied_capabilities")
+                .map(String::as_str),
+            Some("deploy")
         );
         let published_task: TaskPacket = published.payload_as().expect("published task");
         assert_eq!(published_task.id, task.id);
@@ -6347,11 +6485,19 @@ mod tests {
             routed[0].payload["channel_priority"].as_str(),
             Some("Critical")
         );
+        assert_eq!(
+            routed[0].payload["command_system5_identity"].as_str(),
+            Some("Release safety policy")
+        );
+        assert_eq!(
+            routed[0].payload["command_policy_constraints"].as_str(),
+            Some("deployment must remain frozen")
+        );
 
         let mapped = ledger
             .recent_events(EventFilter {
                 kinds: vec![LedgerEventKind::TaskMapped],
-                task_id: Some(task.id),
+                task_id: Some(task.id.clone()),
                 limit: Some(10),
                 ..EventFilter::default()
             })
@@ -6360,6 +6506,28 @@ mod tests {
         assert_eq!(
             mapped[0].payload["decomposition_policy"].as_str(),
             Some("system3_command_channel")
+        );
+        assert_eq!(
+            mapped[0].payload["metadata"]["command_policy_values"].as_str(),
+            Some("protect production stability")
+        );
+
+        let command_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::Other("command_received".to_string())],
+                task_id: Some(task.id.clone()),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("command events");
+        assert_eq!(
+            command_events[0].payload["system5_identity"].as_str(),
+            Some("Release safety policy")
+        );
+        assert_eq!(
+            command_events[0].payload["non_negotiable_constraints"][0].as_str(),
+            Some("deployment must remain frozen")
         );
     }
 

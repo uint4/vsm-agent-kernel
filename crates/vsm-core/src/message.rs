@@ -430,6 +430,16 @@ pub struct Command {
     pub body: String,
     pub non_negotiable: bool,
     pub legal_or_policy_basis: Option<String>,
+    #[serde(default)]
+    pub system5_identity: Option<String>,
+    #[serde(default)]
+    pub policy_values: Vec<String>,
+    #[serde(default)]
+    pub non_negotiable_constraints: Vec<String>,
+    #[serde(default)]
+    pub denied_capabilities: Vec<String>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
