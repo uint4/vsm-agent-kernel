@@ -5,7 +5,7 @@ use crate::{
     DirectiveTaskMapper, EvolutionPolicy, System3StarAuditor, TaskRouter, TrialManager,
     OFFLINE_REPLAY_VERSION,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -13,13 +13,13 @@ use std::{
 };
 use tokio::sync::RwLock;
 use vsm_core::{
-    envelope_for_task, AuditReport, AuditRequest, BuiltinPayloadType, ChannelPriority,
-    Command as VsmCommand, Directive, EnvironmentSignal, FitnessWeights, GeneSuggestion,
-    GeneSuggestionSource, ManagementOperationDirective, MessageEnvelope, NodeId, OperationHandoff,
-    OrganizationalGenome, ResourceAllocationDecision, ResourceAllocationStatus, ResourceBargain,
-    RiskClass, Subscription, System2CoordinationKind, System2CoordinationSignal, TaskOutcomeStatus,
-    TaskPacket, TaskResult, TaskTrace, ThreeFourHomeostatBalance, ThreeFourHomeostatSignal,
-    Transport, VsmChannelType,
+    envelope_for_task, envelope_for_task_result, AuditReport, AuditRequest, BuiltinPayloadType,
+    ChannelPriority, Command as VsmCommand, Directive, EnvironmentSignal, FitnessWeights,
+    GeneSuggestion, GeneSuggestionSource, ManagementOperationDirective, MessageEnvelope, NodeId,
+    OperationHandoff, OrganizationalGenome, ResourceAllocationDecision, ResourceAllocationStatus,
+    ResourceBargain, RiskClass, Subscription, System2CoordinationKind, System2CoordinationSignal,
+    TaskOutcomeStatus, TaskPacket, TaskResult, TaskTrace, ThreeFourHomeostatBalance,
+    ThreeFourHomeostatSignal, Transport, VsmChannelType,
 };
 use vsm_ledger::{
     CandidateObjectiveSnapshot, EventFilter, EvolutionGenerationRecord, GenomeSnapshot,
@@ -550,6 +550,104 @@ impl ControllerRuntime {
         Ok(EnvironmentPressureSummary::from_events(&events))
     }
 
+    async fn recent_coordination_pressure(
+        &self,
+        child_node_id: &NodeId,
+    ) -> Result<CoordinationPressureSummary, ControllerError> {
+        let events = self
+            .ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::Other(
+                    "system2_coordination_signal".to_string(),
+                )],
+                node_id: Some(self.node_id.clone()),
+                limit: Some(100),
+                ..EventFilter::default()
+            })
+            .await?;
+        Ok(CoordinationPressureSummary::from_events(
+            &events,
+            child_node_id,
+        ))
+    }
+
+    async fn subtree_pause_for_child(
+        &self,
+        child_node_id: &NodeId,
+    ) -> Result<Option<SubtreePauseState>, ControllerError> {
+        let events = self
+            .ledger
+            .recent_events(EventFilter {
+                kinds: vec![
+                    LedgerEventKind::Other("algedonic_subtree_paused".to_string()),
+                    LedgerEventKind::Other("algedonic_subtree_resumed".to_string()),
+                ],
+                node_id: Some(self.node_id.clone()),
+                limit: Some(500),
+                ..EventFilter::default()
+            })
+            .await?;
+        let genome = self.genome.read().await;
+        let mut latest_pause: Option<SubtreePauseState> = None;
+        let mut latest_resume_at: Option<DateTime<Utc>> = None;
+
+        for event in events {
+            let Some(target_node_id) = event
+                .payload
+                .get("target_node_id")
+                .and_then(|value| value.as_str())
+                .map(NodeId::from_string)
+            else {
+                continue;
+            };
+            let Ok(target_subtree) = genome.subtree_ids(&target_node_id) else {
+                continue;
+            };
+            if !target_subtree
+                .iter()
+                .any(|node_id| node_id == child_node_id)
+            {
+                continue;
+            }
+
+            match &event.kind {
+                LedgerEventKind::Other(name) if name == "algedonic_subtree_paused" => {
+                    latest_pause = Some(SubtreePauseState {
+                        target_node_id,
+                        paused_at: event.created_at,
+                        reason: event
+                            .payload
+                            .get("message")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("algedonic pause_subtree")
+                            .to_string(),
+                        severity: event
+                            .payload
+                            .get("severity")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(1)
+                            .min(10) as u8,
+                        require_human_confirmation: event
+                            .payload
+                            .get("require_human_confirmation")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false),
+                    });
+                }
+                LedgerEventKind::Other(name) if name == "algedonic_subtree_resumed" => {
+                    latest_resume_at = Some(event.created_at);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(latest_pause.filter(|pause| {
+            latest_resume_at
+                .map(|resumed_at| resumed_at < pause.paused_at)
+                .unwrap_or(true)
+        }))
+    }
+
     pub async fn load_persisted_champion(
         &self,
     ) -> Result<Option<vsm_core::GenomeId>, ControllerError> {
@@ -973,6 +1071,8 @@ impl ControllerRuntime {
                 }
                 self.revise_decomposition_from_result(&result, &envelope)
                     .await?;
+                self.forward_result_to_parent_if_needed(&result, &envelope)
+                    .await?;
                 Ok(ControllerHandleOutcome::ReceivedTaskResult(result))
             }
             payload if payload == BuiltinPayloadType::AlgedonicSignal.as_str() => {
@@ -988,6 +1088,60 @@ impl ControllerRuntime {
             }
             _ => Ok(ControllerHandleOutcome::Ignored),
         }
+    }
+
+    async fn forward_result_to_parent_if_needed(
+        &self,
+        result: &TaskResult,
+        incoming: &MessageEnvelope,
+    ) -> Result<(), ControllerError> {
+        let parent_id = {
+            let genome = self.genome.read().await;
+            genome.get_node(&self.node_id)?.parent_id.clone()
+        };
+        let Some(parent_id) = parent_id else {
+            return Ok(());
+        };
+
+        let mut envelope = envelope_for_task_result(result)?
+            .with_route(Some(self.node_id.clone()), Some(parent_id));
+        envelope.channel_type = VsmChannelType::ManagementToOperation;
+        envelope.priority = ChannelPriority::Normal;
+        envelope.correlation_id = incoming
+            .correlation_id
+            .clone()
+            .or_else(|| Some(incoming.id.to_string()));
+        envelope.causation_id = Some(incoming.id.clone());
+        envelope.trace = incoming.trace.clone();
+        envelope.trace.push(self.node_id.clone());
+        envelope.metadata.insert(
+            "forwarded_by_controller_node_id".to_string(),
+            self.node_id.to_string(),
+        );
+        envelope.metadata.insert(
+            "forwarded_result_task_id".to_string(),
+            result.task_id.to_string(),
+        );
+        envelope.metadata.insert(
+            "vsm_outbound_channel".to_string(),
+            format!("{:?}", envelope.channel_type),
+        );
+        envelope.metadata.insert(
+            "source_payload_type".to_string(),
+            BuiltinPayloadType::TaskResult.as_str().to_string(),
+        );
+
+        if self.config.append_message_events {
+            self.ledger
+                .append_event(LedgerEvent::for_message(
+                    LedgerEventKind::MessagePublished,
+                    &envelope,
+                )?)
+                .await?;
+        }
+
+        self.transport.publish(envelope).await?;
+        Ok(())
     }
 
     async fn log_task_mapped(
@@ -1404,6 +1558,24 @@ impl ControllerRuntime {
         }
 
         let environment_pressure = self.recent_environment_pressure().await?;
+        let coordination_pressure = self
+            .recent_coordination_pressure(&bargain.requested_by)
+            .await?;
+        let allocation_time = Utc::now();
+        let epoch_key = resource_epoch_key(allocation_time);
+        let epoch_budget = {
+            let genome = self.genome.read().await;
+            resource_epoch_budget(&genome, &self.node_id, &bargain.requested_by)
+        };
+        let resource_epoch = resource_epoch_accounting(
+            self.ledger.as_ref(),
+            &self.node_id,
+            &bargain.requested_by,
+            epoch_key,
+            epoch_budget,
+        )
+        .await?;
+        let subtree_pause = self.subtree_pause_for_child(&bargain.requested_by).await?;
         let decision = if let Some((requested_task_id, proposed_task_id)) =
             proposed_task_id_mismatch
         {
@@ -1419,6 +1591,20 @@ impl ControllerRuntime {
                     "resource bargain task_id {requested_task_id} does not match proposed_task id {proposed_task_id}"
                 )],
             )
+        } else if let Some(pause) = &subtree_pause {
+            resource_allocation_decision(
+                &bargain,
+                ResourceAllocationStatus::Denied,
+                None,
+                vec![],
+                bargain.requested_tool_permissions.clone(),
+                vec![],
+                bargain.requested_context_refs.clone(),
+                vec![format!(
+                    "ResourceBargaining denied because subtree {} is paused by algedonic signal: {}",
+                    pause.target_node_id, pause.reason
+                )],
+            )
         } else {
             let genome = self.genome.read().await;
             allocate_resource_bargain(
@@ -1426,6 +1612,8 @@ impl ControllerRuntime {
                 &self.node_id,
                 &bargain,
                 Some(&environment_pressure),
+                Some(&coordination_pressure),
+                Some(&resource_epoch),
             )
         };
 
@@ -1448,6 +1636,15 @@ impl ControllerRuntime {
             "allocation_status".to_string(),
             format!("{:?}", decision.status),
         );
+        event.metadata.insert(
+            "requested_by".to_string(),
+            decision.requested_by.to_string(),
+        );
+        add_resource_epoch_metadata(
+            &mut event.metadata,
+            &resource_epoch,
+            decision.approved_tokens,
+        );
         if resource_pressure_affects_allocation(&environment_pressure) {
             event.metadata.insert(
                 "homeostat_pressure_count".to_string(),
@@ -1461,6 +1658,12 @@ impl ControllerRuntime {
                 "homeostat_pressure_risk".to_string(),
                 environment_pressure.risk_pressure.to_string(),
             );
+        }
+        if coordination_pressure.affects_allocation() {
+            insert_coordination_pressure_metadata(&mut event.metadata, &coordination_pressure);
+        }
+        if let Some(pause) = &subtree_pause {
+            insert_subtree_pause_metadata(&mut event.metadata, pause);
         }
         self.ledger.append_event(event).await?;
 
@@ -1493,6 +1696,11 @@ impl ControllerRuntime {
             "allocation_status".to_string(),
             format!("{:?}", decision.status),
         );
+        add_resource_epoch_metadata(
+            &mut response.metadata,
+            &resource_epoch,
+            decision.approved_tokens,
+        );
         if resource_pressure_affects_allocation(&environment_pressure) {
             response.metadata.insert(
                 "homeostat_pressure_count".to_string(),
@@ -1502,6 +1710,12 @@ impl ControllerRuntime {
                 "homeostat_pressure_max_severity".to_string(),
                 environment_pressure.max_severity.to_string(),
             );
+        }
+        if coordination_pressure.affects_allocation() {
+            insert_coordination_pressure_metadata(&mut response.metadata, &coordination_pressure);
+        }
+        if let Some(pause) = &subtree_pause {
+            insert_subtree_pause_metadata(&mut response.metadata, pause);
         }
 
         if self.config.append_message_events {
@@ -1516,8 +1730,14 @@ impl ControllerRuntime {
 
         if resource_allocation_accepts_work(&decision) {
             if let Some(proposed_task) = bargain.proposed_task {
-                self.accept_resource_bargain_task(proposed_task, &decision, envelope)
-                    .await?;
+                self.accept_resource_bargain_task(
+                    proposed_task,
+                    &decision,
+                    envelope,
+                    Some(&resource_epoch),
+                    Some(&coordination_pressure),
+                )
+                .await?;
             }
         }
         Ok(())
@@ -1528,6 +1748,8 @@ impl ControllerRuntime {
         mut task: TaskPacket,
         decision: &ResourceAllocationDecision,
         envelope: &MessageEnvelope,
+        resource_epoch: Option<&ResourceEpochAccounting>,
+        coordination_pressure: Option<&CoordinationPressureSummary>,
     ) -> Result<(), ControllerError> {
         annotate_incoming_task_channel(&mut task, Some(envelope), &self.node_id);
         task.assigned_to = Some(decision.requested_by.clone());
@@ -1543,6 +1765,18 @@ impl ControllerRuntime {
             "resource_bargain_request_message_id".to_string(),
             envelope.id.to_string(),
         );
+        if let Some(resource_epoch) = resource_epoch {
+            add_resource_epoch_metadata(
+                &mut task.metadata,
+                resource_epoch,
+                decision.approved_tokens,
+            );
+        }
+        if let Some(coordination_pressure) = coordination_pressure {
+            if coordination_pressure.affects_allocation() {
+                insert_coordination_pressure_metadata(&mut task.metadata, coordination_pressure);
+            }
+        }
         if let Some(correlation_id) = envelope.correlation_id.clone() {
             task.metadata.insert(
                 "resource_bargain_correlation_id".to_string(),
@@ -1600,6 +1834,13 @@ impl ControllerRuntime {
                 "source_channel": format!("{:?}", envelope.channel_type),
                 "correlation_id": envelope.correlation_id.clone(),
                 "causation_id": envelope.causation_id.as_ref().map(ToString::to_string),
+                "resource_epoch_key": resource_epoch.map(|epoch| epoch.epoch_key.clone()),
+                "resource_epoch_allocated_before_tokens": resource_epoch.map(|epoch| epoch.allocated_tokens),
+                "resource_epoch_remaining_before_tokens": resource_epoch.and_then(ResourceEpochAccounting::remaining_tokens),
+                "resource_epoch_remaining_after_tokens": resource_epoch.and_then(|epoch| epoch.remaining_tokens_after(decision.approved_tokens)),
+                "coordination_pressure": coordination_pressure
+                    .filter(|pressure| pressure.affects_allocation())
+                    .map(CoordinationPressureSummary::as_json),
             }),
         )?
         .with_node(self.node_id.clone())
@@ -1717,10 +1958,32 @@ impl ControllerRuntime {
             }
         }
         if policy.pause_subtree {
-            actions.push("pause_subtree_requested".to_string());
+            let target_node_id = signal
+                .target_node_id
+                .clone()
+                .unwrap_or_else(|| self.node_id.clone());
+            self.append_algedonic_subtree_pause_event(&signal, &target_node_id, &policy)
+                .await?;
+            actions.push(format!("subtree_paused={target_node_id}"));
+        }
+        if policy.resume_subtree {
+            let target_node_id = signal
+                .target_node_id
+                .clone()
+                .unwrap_or_else(|| self.node_id.clone());
+            self.append_algedonic_subtree_resume_event(&signal, &target_node_id, &policy)
+                .await?;
+            actions.push(format!("subtree_resumed={target_node_id}"));
         }
         if policy.escalate_to_root {
-            actions.push("escalate_to_root_requested".to_string());
+            if self
+                .escalate_algedonic_to_parent_if_needed(&signal, envelope)
+                .await?
+            {
+                actions.push("escalated_to_parent".to_string());
+            } else {
+                actions.push("escalation_at_root".to_string());
+            }
         }
         if policy.require_human_confirmation {
             actions.push("require_human_confirmation".to_string());
@@ -1739,6 +2002,7 @@ impl ControllerRuntime {
                 "actions": actions,
                 "policy": {
                     "pause_subtree": policy.pause_subtree,
+                    "resume_subtree": policy.resume_subtree,
                     "escalate_to_root": policy.escalate_to_root,
                     "freeze_mutation": policy.freeze_mutation,
                     "require_human_confirmation": policy.require_human_confirmation,
@@ -1754,6 +2018,135 @@ impl ControllerRuntime {
         }
         self.ledger.append_event(override_event).await?;
         Ok(())
+    }
+
+    async fn append_algedonic_subtree_pause_event(
+        &self,
+        signal: &vsm_core::AlgedonicSignal,
+        target_node_id: &NodeId,
+        policy: &vsm_core::AlgedonicOverridePolicy,
+    ) -> Result<(), ControllerError> {
+        self.ledger
+            .append_event(
+                LedgerEvent::new(
+                    LedgerEventKind::Other("algedonic_subtree_paused".to_string()),
+                    serde_json::json!({
+                        "target_node_id": target_node_id.to_string(),
+                        "valence": format!("{:?}", signal.valence),
+                        "severity": signal.severity,
+                        "message": signal.message.clone(),
+                        "source": format!("{:?}", signal.source),
+                        "related_task_id": signal.related_task_id.as_ref().map(ToString::to_string),
+                        "related_suggestion_id": signal.related_suggestion_id.as_ref().map(ToString::to_string),
+                        "require_human_confirmation": policy.require_human_confirmation,
+                    }),
+                )?
+                .with_node(self.node_id.clone()),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn append_algedonic_subtree_resume_event(
+        &self,
+        signal: &vsm_core::AlgedonicSignal,
+        target_node_id: &NodeId,
+        policy: &vsm_core::AlgedonicOverridePolicy,
+    ) -> Result<(), ControllerError> {
+        self.ledger
+            .append_event(
+                LedgerEvent::new(
+                    LedgerEventKind::Other("algedonic_subtree_resumed".to_string()),
+                    serde_json::json!({
+                        "target_node_id": target_node_id.to_string(),
+                        "valence": format!("{:?}", signal.valence),
+                        "severity": signal.severity,
+                        "message": signal.message.clone(),
+                        "source": format!("{:?}", signal.source),
+                        "related_task_id": signal.related_task_id.as_ref().map(ToString::to_string),
+                        "related_suggestion_id": signal.related_suggestion_id.as_ref().map(ToString::to_string),
+                        "require_human_confirmation": policy.require_human_confirmation,
+                    }),
+                )?
+                .with_node(self.node_id.clone()),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn escalate_algedonic_to_parent_if_needed(
+        &self,
+        signal: &vsm_core::AlgedonicSignal,
+        incoming: &MessageEnvelope,
+    ) -> Result<bool, ControllerError> {
+        let parent_id = {
+            let genome = self.genome.read().await;
+            genome.get_node(&self.node_id)?.parent_id.clone()
+        };
+        let Some(parent_id) = parent_id else {
+            self.ledger
+                .append_event(
+                    LedgerEvent::new(
+                        LedgerEventKind::Other("algedonic_escalation_at_root".to_string()),
+                        serde_json::json!({
+                            "controller_node_id": self.node_id.to_string(),
+                            "target_node_id": signal.target_node_id.as_ref().map(ToString::to_string),
+                            "severity": signal.severity,
+                            "message": signal.message.clone(),
+                        }),
+                    )?
+                    .with_node(self.node_id.clone()),
+                )
+                .await?;
+            return Ok(false);
+        };
+
+        let mut envelope = MessageEnvelope::new(
+            VsmChannelType::Algedonic,
+            BuiltinPayloadType::AlgedonicSignal.as_str(),
+            signal,
+        )?
+        .with_route(Some(self.node_id.clone()), Some(parent_id));
+        envelope.priority = ChannelPriority::Interrupt;
+        envelope.correlation_id = incoming
+            .correlation_id
+            .clone()
+            .or_else(|| Some(incoming.id.to_string()));
+        envelope.causation_id = Some(incoming.id.clone());
+        envelope.trace = incoming.trace.clone();
+        envelope.trace.push(self.node_id.clone());
+        envelope
+            .metadata
+            .insert("algedonic_escalation".to_string(), "true".to_string());
+        envelope
+            .metadata
+            .insert("escalated_by_node_id".to_string(), self.node_id.to_string());
+
+        self.ledger
+            .append_event(
+                LedgerEvent::new(
+                    LedgerEventKind::Other("algedonic_escalated".to_string()),
+                    serde_json::json!({
+                        "from_node_id": self.node_id.to_string(),
+                        "to_node_id": envelope.target_node_id.as_ref().map(ToString::to_string),
+                        "target_node_id": signal.target_node_id.as_ref().map(ToString::to_string),
+                        "severity": signal.severity,
+                        "message": signal.message.clone(),
+                    }),
+                )?
+                .with_node(self.node_id.clone()),
+            )
+            .await?;
+        if self.config.append_message_events {
+            self.ledger
+                .append_event(LedgerEvent::for_message(
+                    LedgerEventKind::MessagePublished,
+                    &envelope,
+                )?)
+                .await?;
+        }
+        self.transport.publish(envelope).await?;
+        Ok(true)
     }
 
     async fn freeze_active_trial_from_algedonic(
@@ -2323,6 +2716,15 @@ impl ControllerRuntime {
         suggestion_id: Option<vsm_core::SuggestionId>,
         is_shadow_route: bool,
     ) -> Result<RoutedTask, ControllerError> {
+        if let Some(pause) = self.subtree_pause_for_child(&child_id).await? {
+            self.append_subtree_route_blocked_event(&task, &child_id, &pause, incoming)
+                .await?;
+            return Err(ControllerError::NoRouteableChild {
+                node_id: self.node_id.clone(),
+                task_title: format!("{} (subtree paused by algedonic signal)", task.title),
+            });
+        }
+
         annotate_outbound_task_channel(&mut task, &child_id);
 
         let parent_name = {
@@ -2495,6 +2897,41 @@ impl ControllerRuntime {
             child_id,
             reason,
         })
+    }
+
+    async fn append_subtree_route_blocked_event(
+        &self,
+        task: &TaskPacket,
+        child_id: &NodeId,
+        pause: &SubtreePauseState,
+        incoming: Option<&MessageEnvelope>,
+    ) -> Result<(), ControllerError> {
+        let mut event = LedgerEvent::new(
+            LedgerEventKind::Other("algedonic_subtree_route_blocked".to_string()),
+            serde_json::json!({
+                "controller_node_id": self.node_id.to_string(),
+                "child_node_id": child_id.to_string(),
+                "task_id": task.id.to_string(),
+                "task_title": task.title.clone(),
+                "paused_target_node_id": pause.target_node_id.to_string(),
+                "paused_at": pause.paused_at.to_rfc3339(),
+                "reason": pause.reason.clone(),
+                "severity": pause.severity,
+                "require_human_confirmation": pause.require_human_confirmation,
+                "source_channel": incoming.map(|incoming| format!("{:?}", incoming.channel_type)),
+            }),
+        )?
+        .with_node(self.node_id.clone())
+        .with_task(task.id.clone());
+        if let Some(directive_id) = task.directive_id.clone() {
+            event = event.with_directive(directive_id);
+        }
+        if let Some(correlation_id) = incoming.and_then(|incoming| incoming.correlation_id.clone())
+        {
+            event = event.with_correlation(correlation_id);
+        }
+        self.ledger.append_event(event).await?;
+        Ok(())
     }
 
     async fn record_trial_trace_for_result(
@@ -3448,11 +3885,167 @@ fn synthetic_decomposition_revision_envelope(
     Ok(envelope)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ResourceEpochBudget {
+    token_budget: Option<u64>,
+    message_budget: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResourceEpochAccounting {
+    epoch_key: String,
+    token_budget: Option<u64>,
+    message_budget: Option<u64>,
+    allocated_tokens: u64,
+    allocation_count: u64,
+}
+
+impl ResourceEpochAccounting {
+    fn remaining_tokens(&self) -> Option<u64> {
+        self.token_budget
+            .map(|budget| budget.saturating_sub(self.allocated_tokens))
+    }
+
+    fn remaining_tokens_after(&self, approved_tokens: Option<u64>) -> Option<u64> {
+        self.remaining_tokens()
+            .map(|remaining| remaining.saturating_sub(approved_tokens.unwrap_or(0)))
+    }
+
+    fn remaining_messages(&self) -> Option<u64> {
+        self.message_budget
+            .map(|budget| budget.saturating_sub(self.allocation_count))
+    }
+}
+
+fn resource_epoch_key(now: DateTime<Utc>) -> String {
+    now.format("%Y-%m-%dT%H:00:00Z").to_string()
+}
+
+async fn resource_epoch_accounting(
+    ledger: &dyn Ledger,
+    controller_node_id: &NodeId,
+    requested_by: &NodeId,
+    epoch_key: String,
+    budget: ResourceEpochBudget,
+) -> Result<ResourceEpochAccounting, ControllerError> {
+    let events = ledger
+        .recent_events(EventFilter {
+            kinds: vec![LedgerEventKind::Other(
+                "resource_allocation_decision".to_string(),
+            )],
+            node_id: Some(controller_node_id.clone()),
+            limit: Some(10_000),
+            ..EventFilter::default()
+        })
+        .await?;
+
+    let mut allocated_tokens = 0_u64;
+    let mut allocation_count = 0_u64;
+    let requested_by_key = requested_by.to_string();
+    for event in events {
+        if event.metadata.get("resource_epoch_key").map(String::as_str) != Some(epoch_key.as_str())
+        {
+            continue;
+        }
+        if event.metadata.get("requested_by").map(String::as_str) != Some(requested_by_key.as_str())
+        {
+            continue;
+        }
+        allocation_count = allocation_count.saturating_add(1);
+        allocated_tokens = allocated_tokens.saturating_add(
+            event
+                .metadata
+                .get("resource_epoch_approved_tokens")
+                .and_then(|value| value.parse::<u64>().ok())
+                .or_else(|| {
+                    event
+                        .payload
+                        .get("approved_tokens")
+                        .and_then(|value| value.as_u64())
+                })
+                .unwrap_or(0),
+        );
+    }
+
+    Ok(ResourceEpochAccounting {
+        epoch_key,
+        token_budget: budget.token_budget,
+        message_budget: budget.message_budget,
+        allocated_tokens,
+        allocation_count,
+    })
+}
+
+fn add_resource_epoch_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    epoch: &ResourceEpochAccounting,
+    approved_tokens: Option<u64>,
+) {
+    metadata.insert("resource_epoch_key".to_string(), epoch.epoch_key.clone());
+    metadata.insert(
+        "resource_epoch_allocation_count_before".to_string(),
+        epoch.allocation_count.to_string(),
+    );
+    metadata.insert(
+        "resource_epoch_allocation_count_after".to_string(),
+        epoch.allocation_count.saturating_add(1).to_string(),
+    );
+    metadata.insert(
+        "resource_epoch_allocated_before_tokens".to_string(),
+        epoch.allocated_tokens.to_string(),
+    );
+    metadata.insert(
+        "resource_epoch_approved_tokens".to_string(),
+        approved_tokens.unwrap_or(0).to_string(),
+    );
+    if let Some(budget) = epoch.token_budget {
+        metadata.insert(
+            "resource_epoch_budget_tokens".to_string(),
+            budget.to_string(),
+        );
+    }
+    if let Some(remaining) = epoch.remaining_tokens() {
+        metadata.insert(
+            "resource_epoch_remaining_before_tokens".to_string(),
+            remaining.to_string(),
+        );
+    }
+    if let Some(remaining) = epoch.remaining_tokens_after(approved_tokens) {
+        metadata.insert(
+            "resource_epoch_remaining_after_tokens".to_string(),
+            remaining.to_string(),
+        );
+    }
+    if let Some(budget) = epoch.message_budget {
+        metadata.insert(
+            "resource_epoch_message_budget".to_string(),
+            budget.to_string(),
+        );
+    }
+    if let Some(remaining) = epoch.remaining_messages() {
+        metadata.insert(
+            "resource_epoch_remaining_messages_before".to_string(),
+            remaining.to_string(),
+        );
+    }
+    if let Some(remaining) = epoch
+        .remaining_messages()
+        .map(|remaining| remaining.saturating_sub(1))
+    {
+        metadata.insert(
+            "resource_epoch_remaining_messages_after".to_string(),
+            remaining.to_string(),
+        );
+    }
+}
+
 fn allocate_resource_bargain(
     genome: &OrganizationalGenome,
     controller_node_id: &NodeId,
     bargain: &ResourceBargain,
     environment_pressure: Option<&EnvironmentPressureSummary>,
+    coordination_pressure: Option<&CoordinationPressureSummary>,
+    resource_epoch: Option<&ResourceEpochAccounting>,
 ) -> ResourceAllocationDecision {
     let mut reasons = Vec::new();
     let mut approved_tokens = None;
@@ -3525,8 +4118,21 @@ fn allocate_resource_bargain(
         );
     }
 
+    if resource_epoch.and_then(ResourceEpochAccounting::remaining_messages) == Some(0) {
+        return resource_allocation_decision(
+            bargain,
+            ResourceAllocationStatus::Denied,
+            None,
+            vec![],
+            bargain.requested_tool_permissions.clone(),
+            vec![],
+            bargain.requested_context_refs.clone(),
+            vec!["ResourceBargaining message budget exhausted for this epoch".to_string()],
+        );
+    }
+
     if let Some(requested_tokens) = bargain.requested_tokens {
-        let mut token_cap = resource_token_cap(genome, parent, requester);
+        let mut token_cap = resource_task_token_cap(parent, requester);
         if let Some(pressure_cap) = environment_pressure
             .and_then(|pressure| homeostat_resource_token_cap(pressure, requested_tokens))
         {
@@ -3541,6 +4147,42 @@ fn allocate_resource_bargain(
                     "requested_tokens={} capped_to={} by Three-Four homeostat resource pressure",
                     requested_tokens,
                     token_cap.unwrap_or(pressure_cap)
+                ));
+            }
+        }
+        if let Some(coordination_cap) = coordination_pressure
+            .and_then(|pressure| coordination_pressure_token_cap(pressure, requested_tokens))
+        {
+            let applies = token_cap.map(|cap| coordination_cap < cap).unwrap_or(true);
+            token_cap = Some(
+                token_cap
+                    .map(|cap| cap.min(coordination_cap))
+                    .unwrap_or(coordination_cap),
+            );
+            if applies {
+                reasons.push(format!(
+                    "requested_tokens={} capped_to={} by System 2 coordination pressure",
+                    requested_tokens,
+                    token_cap.unwrap_or(coordination_cap)
+                ));
+            }
+        }
+        if let Some(remaining_tokens) =
+            resource_epoch.and_then(ResourceEpochAccounting::remaining_tokens)
+        {
+            let applies = token_cap.map(|cap| remaining_tokens < cap).unwrap_or(true);
+            token_cap = Some(
+                token_cap
+                    .map(|cap| cap.min(remaining_tokens))
+                    .unwrap_or(remaining_tokens),
+            );
+            if remaining_tokens == 0 {
+                reasons
+                    .push("ResourceBargaining token budget exhausted for this epoch".to_string());
+            } else if applies && requested_tokens > remaining_tokens {
+                reasons.push(format!(
+                    "requested_tokens={} capped_to={} by ResourceBargaining epoch budget",
+                    requested_tokens, remaining_tokens
                 ));
             }
         }
@@ -3789,6 +4431,181 @@ impl EnvironmentPressureSummary {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct CoordinationPressureSummary {
+    event_count: u64,
+    contention_count: u64,
+    oscillation_count: u64,
+    dependency_blocked_count: u64,
+    pressure: f64,
+    max_severity: u8,
+    reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SubtreePauseState {
+    target_node_id: NodeId,
+    paused_at: DateTime<Utc>,
+    reason: String,
+    severity: u8,
+    require_human_confirmation: bool,
+}
+
+impl CoordinationPressureSummary {
+    fn from_events(events: &[LedgerEvent], child_node_id: &NodeId) -> Self {
+        let child_key = child_node_id.to_string();
+        let mut summary = Self::default();
+        for event in events {
+            if !coordination_event_affects_child(event, &child_key) {
+                continue;
+            }
+            let kind = event
+                .payload
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    event
+                        .metadata
+                        .get("coordination_kind")
+                        .map(std::string::String::as_str)
+                })
+                .unwrap_or("Other");
+            let severity = event
+                .payload
+                .get("severity")
+                .and_then(|value| value.as_u64())
+                .or_else(|| {
+                    event
+                        .metadata
+                        .get("severity")
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+                .unwrap_or(1)
+                .min(10) as u8;
+            let pressure = f64::from(severity.max(1));
+            match kind {
+                "Contention" => {
+                    summary.event_count += 1;
+                    summary.contention_count += 1;
+                    summary.pressure += pressure;
+                }
+                "Oscillation" => {
+                    summary.event_count += 1;
+                    summary.oscillation_count += 1;
+                    summary.pressure += pressure * 1.25;
+                }
+                "DependencyBlocked" => {
+                    summary.event_count += 1;
+                    summary.dependency_blocked_count += 1;
+                    summary.pressure += pressure * 0.75;
+                }
+                _ => continue,
+            }
+            summary.max_severity = summary.max_severity.max(severity);
+            if summary.reasons.len() < 8 {
+                summary.reasons.push(format!(
+                    "system2_coordination kind={kind} severity={severity}"
+                ));
+            }
+        }
+        summary
+    }
+
+    fn affects_allocation(&self) -> bool {
+        self.event_count > 0 && (self.max_severity >= 5 || self.pressure >= 8.0)
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "event_count": self.event_count,
+            "contention_count": self.contention_count,
+            "oscillation_count": self.oscillation_count,
+            "dependency_blocked_count": self.dependency_blocked_count,
+            "pressure": self.pressure,
+            "max_severity": self.max_severity,
+            "reasons": self.reasons,
+        })
+    }
+}
+
+fn coordination_event_affects_child(event: &LedgerEvent, child_key: &str) -> bool {
+    event
+        .payload
+        .get("source_node_id")
+        .and_then(|value| value.as_str())
+        == Some(child_key)
+        || event
+            .payload
+            .get("target_node_id")
+            .and_then(|value| value.as_str())
+            == Some(child_key)
+        || event
+            .payload
+            .get("affected_node_ids")
+            .and_then(|value| value.as_array())
+            .is_some_and(|nodes| nodes.iter().any(|node| node.as_str() == Some(child_key)))
+}
+
+fn insert_coordination_pressure_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    pressure: &CoordinationPressureSummary,
+) {
+    metadata.insert(
+        "coordination_pressure_count".to_string(),
+        pressure.event_count.to_string(),
+    );
+    metadata.insert(
+        "coordination_contention_count".to_string(),
+        pressure.contention_count.to_string(),
+    );
+    metadata.insert(
+        "coordination_oscillation_count".to_string(),
+        pressure.oscillation_count.to_string(),
+    );
+    metadata.insert(
+        "coordination_dependency_blocked_count".to_string(),
+        pressure.dependency_blocked_count.to_string(),
+    );
+    metadata.insert(
+        "coordination_pressure".to_string(),
+        format!("{:.3}", pressure.pressure),
+    );
+    metadata.insert(
+        "coordination_max_severity".to_string(),
+        pressure.max_severity.to_string(),
+    );
+    if !pressure.reasons.is_empty() {
+        metadata.insert(
+            "coordination_pressure_reasons".to_string(),
+            pressure.reasons.join("|"),
+        );
+    }
+}
+
+fn insert_subtree_pause_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    pause: &SubtreePauseState,
+) {
+    metadata.insert("algedonic_subtree_paused".to_string(), "true".to_string());
+    metadata.insert(
+        "algedonic_paused_target_node_id".to_string(),
+        pause.target_node_id.to_string(),
+    );
+    metadata.insert(
+        "algedonic_paused_at".to_string(),
+        pause.paused_at.to_rfc3339(),
+    );
+    metadata.insert("algedonic_pause_reason".to_string(), pause.reason.clone());
+    metadata.insert(
+        "algedonic_pause_severity".to_string(),
+        pause.severity.to_string(),
+    );
+    metadata.insert(
+        "algedonic_pause_requires_human_confirmation".to_string(),
+        pause.require_human_confirmation.to_string(),
+    );
+}
+
 fn apply_environment_pressure(
     record: &StoredTrialRecord,
     mut evaluation: crate::QueuedCandidateEvaluation,
@@ -3992,8 +4809,7 @@ fn insert_environment_pressure_metadata(
     }
 }
 
-fn resource_token_cap(
-    genome: &OrganizationalGenome,
+fn resource_task_token_cap(
     parent: &vsm_core::ViableNode,
     requester: &vsm_core::ViableNode,
 ) -> Option<u64> {
@@ -4004,21 +4820,37 @@ fn resource_token_cap(
     if let Some(cap) = requester.context_policy.max_total_task_tokens {
         caps.push(cap);
     }
+    caps.into_iter().min()
+}
+
+fn resource_epoch_budget(
+    genome: &OrganizationalGenome,
+    controller_node_id: &NodeId,
+    requester_node_id: &NodeId,
+) -> ResourceEpochBudget {
+    let mut token_budgets = Vec::new();
+    let mut message_budgets = Vec::new();
     for channel in &genome.channels {
         if channel.channel_type != VsmChannelType::ResourceBargaining {
             continue;
         }
-        let connects_parent_child =
-            channel.from.as_ref() == Some(&parent.id) && channel.to.as_ref() == Some(&requester.id);
-        let connects_child_parent =
-            channel.from.as_ref() == Some(&requester.id) && channel.to.as_ref() == Some(&parent.id);
+        let connects_parent_child = channel.from.as_ref() == Some(controller_node_id)
+            && channel.to.as_ref() == Some(requester_node_id);
+        let connects_child_parent = channel.from.as_ref() == Some(requester_node_id)
+            && channel.to.as_ref() == Some(controller_node_id);
         if connects_parent_child || connects_child_parent {
             if let Some(cap) = channel.max_token_budget_per_epoch {
-                caps.push(cap);
+                token_budgets.push(cap);
+            }
+            if let Some(cap) = channel.max_messages_per_epoch {
+                message_budgets.push(cap);
             }
         }
     }
-    caps.into_iter().min()
+    ResourceEpochBudget {
+        token_budget: token_budgets.into_iter().min(),
+        message_budget: message_budgets.into_iter().min(),
+    }
 }
 
 fn resource_pressure_affects_allocation(pressure: &EnvironmentPressureSummary) -> bool {
@@ -4033,6 +4865,24 @@ fn homeostat_resource_token_cap(
         return None;
     }
     let divisor = if pressure.max_severity >= 9 || pressure.risk_pressure >= 12.0 {
+        4
+    } else {
+        2
+    };
+    Some((requested_tokens / divisor).max(1))
+}
+
+fn coordination_pressure_token_cap(
+    pressure: &CoordinationPressureSummary,
+    requested_tokens: u64,
+) -> Option<u64> {
+    if !pressure.affects_allocation() {
+        return None;
+    }
+    let divisor = if pressure.max_severity >= 8
+        || pressure.oscillation_count > 1
+        || pressure.pressure >= 16.0
+    {
         4
     } else {
         2
@@ -6519,6 +7369,279 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resource_bargain_epoch_budget_accumulates_approved_tokens() {
+        let (mut genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let child_id = genome
+            .get_node(&root_id)
+            .expect("root")
+            .children
+            .first()
+            .cloned()
+            .expect("child");
+        genome
+            .get_node_mut(&root_id)
+            .expect("root mut")
+            .system_3
+            .default_task_budget_tokens = Some(2_000);
+        for channel in &mut genome.channels {
+            if channel.channel_type == VsmChannelType::ResourceBargaining
+                && ((channel.from.as_ref() == Some(&root_id)
+                    && channel.to.as_ref() == Some(&child_id))
+                    || (channel.from.as_ref() == Some(&child_id)
+                        && channel.to.as_ref() == Some(&root_id)))
+            {
+                channel.max_token_budget_per_epoch = Some(1_000);
+            }
+        }
+
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut child_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![VsmChannelType::ResourceBargaining],
+                target_node_id: Some(child_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe child");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+
+        let first_task_id = TaskId::new();
+        let first_bargain = ResourceBargain {
+            requested_by: child_id.clone(),
+            task_id: Some(first_task_id),
+            proposed_task: None,
+            requested_tokens: Some(700),
+            requested_tool_permissions: vec![],
+            requested_context_refs: vec![],
+            justification: "Need first epoch slice".to_string(),
+        };
+        let first_envelope = MessageEnvelope::new(
+            VsmChannelType::ResourceBargaining,
+            BuiltinPayloadType::ResourceBargain.as_str(),
+            &first_bargain,
+        )
+        .expect("first resource bargain envelope")
+        .with_route(Some(child_id.clone()), Some(root_id.clone()));
+        controller
+            .handle_envelope(first_envelope)
+            .await
+            .expect("handle first resource bargain");
+        let first_published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
+                .await
+                .expect("first published allocation decision")
+                .expect("stream item")
+                .expect("published first envelope");
+        let first_decision: ResourceAllocationDecision =
+            first_published.payload_as().expect("first decision");
+        assert_eq!(first_decision.status, ResourceAllocationStatus::Approved);
+        assert_eq!(first_decision.approved_tokens, Some(700));
+        assert_eq!(
+            first_published
+                .metadata
+                .get("resource_epoch_budget_tokens")
+                .map(String::as_str),
+            Some("1000")
+        );
+        assert_eq!(
+            first_published
+                .metadata
+                .get("resource_epoch_remaining_after_tokens")
+                .map(String::as_str),
+            Some("300")
+        );
+
+        let second_task_id = TaskId::new();
+        let second_bargain = ResourceBargain {
+            requested_by: child_id.clone(),
+            task_id: Some(second_task_id.clone()),
+            proposed_task: None,
+            requested_tokens: Some(700),
+            requested_tool_permissions: vec![],
+            requested_context_refs: vec![],
+            justification: "Need second epoch slice".to_string(),
+        };
+        let second_envelope = MessageEnvelope::new(
+            VsmChannelType::ResourceBargaining,
+            BuiltinPayloadType::ResourceBargain.as_str(),
+            &second_bargain,
+        )
+        .expect("second resource bargain envelope")
+        .with_route(Some(child_id), Some(root_id));
+        controller
+            .handle_envelope(second_envelope)
+            .await
+            .expect("handle second resource bargain");
+        let second_published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
+                .await
+                .expect("second published allocation decision")
+                .expect("stream item")
+                .expect("published second envelope");
+        let second_decision: ResourceAllocationDecision =
+            second_published.payload_as().expect("second decision");
+        assert_eq!(
+            second_decision.status,
+            ResourceAllocationStatus::PartiallyApproved
+        );
+        assert_eq!(second_decision.approved_tokens, Some(300));
+        assert!(second_decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("ResourceBargaining epoch budget")));
+        assert_eq!(
+            second_published
+                .metadata
+                .get("resource_epoch_allocated_before_tokens")
+                .map(String::as_str),
+            Some("700")
+        );
+        assert_eq!(
+            second_published
+                .metadata
+                .get("resource_epoch_remaining_before_tokens")
+                .map(String::as_str),
+            Some("300")
+        );
+        assert_eq!(
+            second_published
+                .metadata
+                .get("resource_epoch_remaining_after_tokens")
+                .map(String::as_str),
+            Some("0")
+        );
+
+        let allocation_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::Other(
+                    "resource_allocation_decision".to_string(),
+                )],
+                task_id: Some(second_task_id),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("allocation events");
+        assert_eq!(
+            allocation_events[0]
+                .metadata
+                .get("resource_epoch_allocated_before_tokens")
+                .map(String::as_str),
+            Some("700")
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_bargain_epoch_message_budget_denies_after_cap() {
+        let (mut genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let child_id = genome
+            .get_node(&root_id)
+            .expect("root")
+            .children
+            .first()
+            .cloned()
+            .expect("child");
+        let child = genome.get_node_mut(&child_id).expect("child mut");
+        child
+            .permissions
+            .allowed_tools
+            .push("read_filesystem".to_string());
+        for channel in &mut genome.channels {
+            if channel.channel_type == VsmChannelType::ResourceBargaining
+                && ((channel.from.as_ref() == Some(&root_id)
+                    && channel.to.as_ref() == Some(&child_id))
+                    || (channel.from.as_ref() == Some(&child_id)
+                        && channel.to.as_ref() == Some(&root_id)))
+            {
+                channel.max_messages_per_epoch = Some(1);
+            }
+        }
+
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut child_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![VsmChannelType::ResourceBargaining],
+                target_node_id: Some(child_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe child");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+
+        for title in ["first", "second"] {
+            let bargain = ResourceBargain {
+                requested_by: child_id.clone(),
+                task_id: Some(TaskId::new()),
+                proposed_task: None,
+                requested_tokens: None,
+                requested_tool_permissions: vec!["read_filesystem".to_string()],
+                requested_context_refs: vec![],
+                justification: format!("Need {title} resource bargain message"),
+            };
+            let envelope = MessageEnvelope::new(
+                VsmChannelType::ResourceBargaining,
+                BuiltinPayloadType::ResourceBargain.as_str(),
+                &bargain,
+            )
+            .expect("resource bargain envelope")
+            .with_route(Some(child_id.clone()), Some(root_id.clone()));
+            controller
+                .handle_envelope(envelope)
+                .await
+                .expect("handle resource bargain");
+        }
+
+        let first_published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
+                .await
+                .expect("first published allocation decision")
+                .expect("stream item")
+                .expect("published first envelope");
+        let first_decision: ResourceAllocationDecision =
+            first_published.payload_as().expect("first decision");
+        assert_eq!(first_decision.status, ResourceAllocationStatus::Approved);
+
+        let second_published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
+                .await
+                .expect("second published allocation decision")
+                .expect("stream item")
+                .expect("published second envelope");
+        let second_decision: ResourceAllocationDecision =
+            second_published.payload_as().expect("second decision");
+        assert_eq!(second_decision.status, ResourceAllocationStatus::Denied);
+        assert!(second_decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("message budget exhausted")));
+        assert_eq!(
+            second_published
+                .metadata
+                .get("resource_epoch_remaining_messages_before")
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[tokio::test]
     async fn resource_bargain_accepts_and_routes_proposed_task() {
         let (mut genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
         let root_id = genome.root_node_id.clone();
@@ -6769,6 +7892,144 @@ mod tests {
             allocation_events[0]
                 .metadata
                 .get("homeostat_pressure_count")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_bargain_uses_system2_contention_pressure_to_constrain_tokens() {
+        let (mut genome, coder_id, reviewer_id, _tester_id) = genome_with_coder_reviewer_tester();
+        let root_id = genome.root_node_id.clone();
+        genome
+            .get_node_mut(&root_id)
+            .expect("root mut")
+            .system_3
+            .default_task_budget_tokens = Some(1_000);
+
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut coder_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![
+                    VsmChannelType::ResourceBargaining,
+                    VsmChannelType::System2Coordination,
+                ],
+                target_node_id: Some(coder_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe coder");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+
+        let affected_task_id = TaskId::new();
+        let mut signal = System2CoordinationSignal::new(
+            root_id.clone(),
+            System2CoordinationKind::Contention,
+            "implementation child is contending with review work on the same dependency",
+        );
+        signal.source_node_id = Some(reviewer_id);
+        signal.target_node_id = Some(coder_id.clone());
+        signal.affected_node_ids = vec![coder_id.clone()];
+        signal.affected_task_ids = vec![affected_task_id];
+        signal.severity = Some(8);
+        let signal_envelope = MessageEnvelope::new(
+            VsmChannelType::System2Coordination,
+            BuiltinPayloadType::System2CoordinationSignal.as_str(),
+            &signal,
+        )
+        .expect("system2 signal envelope")
+        .with_route(Some(root_id.clone()), Some(root_id.clone()));
+        controller
+            .handle_envelope(signal_envelope)
+            .await
+            .expect("handle system2 contention");
+
+        let dampening_envelope =
+            tokio::time::timeout(std::time::Duration::from_millis(250), coder_stream.next())
+                .await
+                .expect("published dampening task")
+                .expect("stream item")
+                .expect("published dampening envelope");
+        assert_eq!(
+            dampening_envelope.channel_type,
+            VsmChannelType::System2Coordination
+        );
+
+        let bargain = ResourceBargain {
+            requested_by: coder_id.clone(),
+            task_id: Some(TaskId::new()),
+            proposed_task: None,
+            requested_tokens: Some(800),
+            requested_tool_permissions: vec![],
+            requested_context_refs: vec![],
+            justification: "Need implementation tokens while System 2 reports contention"
+                .to_string(),
+        };
+        let bargain_envelope = MessageEnvelope::new(
+            VsmChannelType::ResourceBargaining,
+            BuiltinPayloadType::ResourceBargain.as_str(),
+            &bargain,
+        )
+        .expect("resource bargain envelope")
+        .with_route(Some(coder_id), Some(root_id));
+        controller
+            .handle_envelope(bargain_envelope)
+            .await
+            .expect("handle contention-aware resource bargain");
+
+        let published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), coder_stream.next())
+                .await
+                .expect("published allocation decision")
+                .expect("stream item")
+                .expect("published decision envelope");
+        assert_eq!(published.channel_type, VsmChannelType::ResourceBargaining);
+        let decision: ResourceAllocationDecision =
+            published.payload_as().expect("allocation decision");
+        assert_eq!(decision.status, ResourceAllocationStatus::PartiallyApproved);
+        assert_eq!(decision.approved_tokens, Some(200));
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("System 2 coordination pressure")));
+        assert_eq!(
+            published
+                .metadata
+                .get("coordination_pressure_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("coordination_max_severity")
+                .map(String::as_str),
+            Some("8")
+        );
+
+        let allocation_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::Other(
+                    "resource_allocation_decision".to_string(),
+                )],
+                task_id: bargain.task_id,
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("allocation events");
+        assert_eq!(
+            allocation_events[0]
+                .metadata
+                .get("coordination_contention_count")
                 .map(String::as_str),
             Some("1")
         );
@@ -7251,6 +8512,332 @@ mod tests {
         assert_eq!(
             routed[0].payload["source_channel"].as_str(),
             Some("System2Coordination")
+        );
+    }
+
+    #[tokio::test]
+    async fn algedonic_pause_blocks_and_resume_reopens_subtree_routing() {
+        let (genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let child_id = genome
+            .get_node(&root_id)
+            .expect("root")
+            .children
+            .first()
+            .cloned()
+            .expect("child");
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut child_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![VsmChannelType::ResourceBargaining],
+                target_node_id: Some(child_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe child");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+
+        let mut pause = vsm_core::AlgedonicSignal::pain(
+            vsm_core::AlgedonicSource::User,
+            9,
+            "pause this child until the human confirms the failure is resolved",
+        );
+        pause.target_node_id = Some(child_id.clone());
+        pause.override_policy = Some(vsm_core::AlgedonicOverridePolicy {
+            pause_subtree: true,
+            require_human_confirmation: true,
+            ..vsm_core::AlgedonicOverridePolicy::default()
+        });
+        let pause_envelope = MessageEnvelope::new(
+            VsmChannelType::Algedonic,
+            BuiltinPayloadType::AlgedonicSignal.as_str(),
+            &pause,
+        )
+        .expect("pause envelope")
+        .with_route(None, Some(root_id.clone()));
+        controller
+            .handle_envelope(pause_envelope)
+            .await
+            .expect("handle pause");
+
+        let blocked_task = TaskPacket::new("Blocked task", "should not route while paused");
+        let blocked_task_id = blocked_task.id.clone();
+        let blocked_envelope = envelope_for_task(&blocked_task)
+            .expect("blocked task envelope")
+            .with_route(None, Some(root_id.clone()));
+        let blocked = controller.handle_envelope(blocked_envelope).await;
+        assert!(matches!(
+            blocked,
+            Err(ControllerError::NoRouteableChild { .. })
+        ));
+        let blocked_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::Other(
+                    "algedonic_subtree_route_blocked".to_string(),
+                )],
+                task_id: Some(blocked_task_id),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("blocked events");
+        assert_eq!(blocked_events.len(), 1);
+        assert_eq!(
+            blocked_events[0].payload["paused_target_node_id"].as_str(),
+            Some(child_id.as_str())
+        );
+
+        let mut resume = vsm_core::AlgedonicSignal::pain(
+            vsm_core::AlgedonicSource::User,
+            3,
+            "resume child after human confirmation",
+        );
+        resume.valence = vsm_core::AlgedonicValence::Pleasure;
+        resume.target_node_id = Some(child_id.clone());
+        resume.override_policy = Some(vsm_core::AlgedonicOverridePolicy {
+            resume_subtree: true,
+            require_human_confirmation: true,
+            ..vsm_core::AlgedonicOverridePolicy::default()
+        });
+        let resume_envelope = MessageEnvelope::new(
+            VsmChannelType::Algedonic,
+            BuiltinPayloadType::AlgedonicSignal.as_str(),
+            &resume,
+        )
+        .expect("resume envelope")
+        .with_route(None, Some(root_id.clone()));
+        controller
+            .handle_envelope(resume_envelope)
+            .await
+            .expect("handle resume");
+
+        let resumed_task = TaskPacket::new("Resumed task", "should route after resume");
+        let resumed_task_id = resumed_task.id.clone();
+        let resumed_envelope = envelope_for_task(&resumed_task)
+            .expect("resumed task envelope")
+            .with_route(None, Some(root_id));
+        let routed = controller
+            .handle_envelope(resumed_envelope)
+            .await
+            .expect("route after resume");
+        assert!(matches!(routed, ControllerHandleOutcome::RoutedTask { .. }));
+        let published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
+                .await
+                .expect("published resumed task")
+                .expect("stream item")
+                .expect("published envelope");
+        assert_eq!(published.channel_type, VsmChannelType::ResourceBargaining);
+        let routed_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::TaskRouted],
+                task_id: Some(resumed_task_id),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("routed events");
+        assert_eq!(routed_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn algedonic_pause_denies_resource_bargain_for_target_child() {
+        let (mut genome, _suggestion, _reviewer_id) = genome_and_review_suggestion();
+        let root_id = genome.root_node_id.clone();
+        let child_id = genome
+            .get_node(&root_id)
+            .expect("root")
+            .children
+            .first()
+            .cloned()
+            .expect("child");
+        genome
+            .get_node_mut(&root_id)
+            .expect("root mut")
+            .system_3
+            .default_task_budget_tokens = Some(1_000);
+
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut child_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![VsmChannelType::ResourceBargaining],
+                target_node_id: Some(child_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe child");
+        let controller = ControllerRuntime::new(
+            root_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+
+        let mut pause = vsm_core::AlgedonicSignal::pain(
+            vsm_core::AlgedonicSource::Ci,
+            8,
+            "child is causing repeated integration failures",
+        );
+        pause.target_node_id = Some(child_id.clone());
+        pause.override_policy = Some(vsm_core::AlgedonicOverridePolicy {
+            pause_subtree: true,
+            ..vsm_core::AlgedonicOverridePolicy::default()
+        });
+        let pause_envelope = MessageEnvelope::new(
+            VsmChannelType::Algedonic,
+            BuiltinPayloadType::AlgedonicSignal.as_str(),
+            &pause,
+        )
+        .expect("pause envelope")
+        .with_route(None, Some(root_id.clone()));
+        controller
+            .handle_envelope(pause_envelope)
+            .await
+            .expect("handle pause");
+
+        let bargain = ResourceBargain {
+            requested_by: child_id.clone(),
+            task_id: Some(TaskId::new()),
+            proposed_task: None,
+            requested_tokens: Some(500),
+            requested_tool_permissions: vec![],
+            requested_context_refs: vec![],
+            justification: "request work while paused".to_string(),
+        };
+        let bargain_envelope = MessageEnvelope::new(
+            VsmChannelType::ResourceBargaining,
+            BuiltinPayloadType::ResourceBargain.as_str(),
+            &bargain,
+        )
+        .expect("resource bargain envelope")
+        .with_route(Some(child_id), Some(root_id));
+        controller
+            .handle_envelope(bargain_envelope)
+            .await
+            .expect("handle paused bargain");
+
+        let published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), child_stream.next())
+                .await
+                .expect("published allocation decision")
+                .expect("stream item")
+                .expect("published decision envelope");
+        let decision: ResourceAllocationDecision =
+            published.payload_as().expect("allocation decision");
+        assert_eq!(decision.status, ResourceAllocationStatus::Denied);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("paused by algedonic signal")));
+        assert_eq!(
+            published
+                .metadata
+                .get("algedonic_subtree_paused")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn algedonic_escalation_forwards_signal_to_parent_controller() {
+        let root = ViableNode::new_metasystem("root");
+        let root_id = root.id.clone();
+        let mut genome = OrganizationalGenome::new(root);
+        let backend = ViableNode::new_metasystem("backend-system");
+        let backend_id = backend.id.clone();
+        genome
+            .add_child(&root_id, backend)
+            .expect("backend metasystem");
+
+        let ledger = Arc::new(InMemoryLedger::new());
+        let shared_genome = Arc::new(RwLock::new(genome));
+        let transport = Arc::new(InMemoryTransport::new(16));
+        let mut root_stream = transport
+            .subscribe(Subscription {
+                channel_types: vec![VsmChannelType::Algedonic],
+                target_node_id: Some(root_id.to_string()),
+                queue_name: None,
+                durable: false,
+            })
+            .await
+            .expect("subscribe root");
+        let controller = ControllerRuntime::new(
+            backend_id.clone(),
+            shared_genome,
+            transport,
+            ledger.clone() as Arc<dyn Ledger>,
+        );
+
+        let mut signal = vsm_core::AlgedonicSignal::pain(
+            vsm_core::AlgedonicSource::ChildNode,
+            9,
+            "backend child reports severe pain that root must see",
+        );
+        signal.target_node_id = Some(backend_id.clone());
+        signal.override_policy = Some(vsm_core::AlgedonicOverridePolicy {
+            escalate_to_root: true,
+            ..vsm_core::AlgedonicOverridePolicy::default()
+        });
+        let envelope = MessageEnvelope::new(
+            VsmChannelType::Algedonic,
+            BuiltinPayloadType::AlgedonicSignal.as_str(),
+            &signal,
+        )
+        .expect("algedonic envelope")
+        .with_route(None, Some(backend_id.clone()));
+
+        controller
+            .handle_envelope(envelope)
+            .await
+            .expect("handle escalated algedonic signal");
+
+        let published =
+            tokio::time::timeout(std::time::Duration::from_millis(250), root_stream.next())
+                .await
+                .expect("published escalated signal")
+                .expect("stream item")
+                .expect("published envelope");
+        assert_eq!(published.channel_type, VsmChannelType::Algedonic);
+        assert_eq!(published.priority, ChannelPriority::Interrupt);
+        assert_eq!(
+            published
+                .metadata
+                .get("algedonic_escalation")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            published
+                .metadata
+                .get("escalated_by_node_id")
+                .map(String::as_str),
+            Some(backend_id.as_str())
+        );
+
+        let escalated_events = ledger
+            .recent_events(EventFilter {
+                kinds: vec![LedgerEventKind::Other("algedonic_escalated".to_string())],
+                node_id: Some(backend_id),
+                limit: Some(10),
+                ..EventFilter::default()
+            })
+            .await
+            .expect("escalated events");
+        assert_eq!(escalated_events.len(), 1);
+        assert_eq!(
+            escalated_events[0].payload["to_node_id"].as_str(),
+            Some(root_id.as_str())
         );
     }
 

@@ -83,6 +83,8 @@ pub enum AlgedonicSource {
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AlgedonicOverridePolicy {
     pub pause_subtree: bool,
+    #[serde(default)]
+    pub resume_subtree: bool,
     pub escalate_to_root: bool,
     pub freeze_mutation: bool,
     pub require_human_confirmation: bool,

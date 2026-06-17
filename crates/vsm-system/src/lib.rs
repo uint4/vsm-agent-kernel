@@ -125,6 +125,28 @@ impl LocalVsmSystem {
         genome
     }
 
+    pub fn nested_coder_genome() -> OrganizationalGenome {
+        let root = ViableNode::new_metasystem("root-codebase-system");
+        let root_id = root.id.clone();
+        let mut genome = OrganizationalGenome::new(root);
+
+        let mut backend = ViableNode::new_metasystem("backend-system");
+        backend.system_5.identity = "Backend viable subsystem.".to_string();
+        let backend_id = genome
+            .add_child(&root_id, backend)
+            .expect("fresh root should accept backend subsystem");
+
+        let mut coder = ViableNode::new_leaf("backend-coder", LeafOperationSpec::coding());
+        coder.system_5.identity = "Backend coding leaf.".to_string();
+        coder.model.provider = "local".to_string();
+        coder.model.model = "local-worker".to_string();
+        genome
+            .add_child(&backend_id, coder)
+            .expect("backend subsystem should accept coder child");
+
+        genome
+    }
+
     pub fn root_node_id(&self) -> NodeId {
         self.root_node_id.clone()
     }
@@ -156,6 +178,11 @@ impl LocalVsmSystem {
         directive: Directive,
         expected_results: usize,
     ) -> Result<DirectiveRunReport, SystemRunError> {
+        let mut controllers = Vec::new();
+        for controller in self.current_child_controllers().await? {
+            controllers.push(tokio::spawn(async move { controller.run_forever().await }));
+        }
+
         let mut workers = Vec::new();
         for worker in self.current_worker_harnesses().await? {
             workers.push(tokio::spawn(async move { worker.run_forever().await }));
@@ -178,6 +205,10 @@ impl LocalVsmSystem {
         for worker in workers {
             worker.abort();
             let _ = worker.await;
+        }
+        for controller in controllers {
+            controller.abort();
+            let _ = controller.await;
         }
 
         let traces = self
@@ -250,7 +281,6 @@ impl LocalVsmSystem {
         let mut workers = worker_harnesses_for_genome(
             &champion,
             self.genome.clone(),
-            &self.root_node_id,
             self.transport.clone(),
             self.ledger.clone(),
             self.default_provider.clone(),
@@ -278,22 +308,41 @@ impl LocalVsmSystem {
 
         Ok(workers)
     }
+
+    async fn current_child_controllers(&self) -> Result<Vec<ControllerRuntime>, SystemRunError> {
+        let champion = self.genome.read().await.clone();
+        let metasystem_ids = child_metasystem_node_ids(&champion, &self.root_node_id);
+        let mut controllers = Vec::new();
+        for node_id in metasystem_ids {
+            let transport: Arc<dyn Transport> = self.transport.clone();
+            controllers.push(
+                ControllerRuntime::new(
+                    node_id,
+                    self.genome.clone(),
+                    transport,
+                    self.ledger.clone(),
+                )
+                .with_trial_config(
+                    self.config.trial_config.clone(),
+                    self.config.fitness_weights.clone(),
+                ),
+            );
+        }
+        Ok(controllers)
+    }
 }
 
 async fn worker_harnesses_for_genome(
     genome: &OrganizationalGenome,
     shared_genome: SharedGenome,
-    parent_node_id: &NodeId,
     transport: Arc<InMemoryTransport>,
     ledger: Arc<dyn Ledger>,
     default_provider: Arc<dyn ModelProvider>,
     providers_by_node: Arc<RwLock<BTreeMap<NodeId, Arc<dyn ModelProvider>>>>,
 ) -> Result<Vec<WorkerHarness>, SystemRunError> {
-    let parent = genome.get_node(parent_node_id)?;
-    let node_ids = parent
-        .children
-        .iter()
-        .filter_map(|child_id| genome.get_node(child_id).ok())
+    let node_ids = genome
+        .nodes
+        .values()
         .filter(|child| child.is_leaf() && child.status != vsm_core::NodeLifecycleStatus::Retired)
         .map(|child| child.id.clone())
         .collect::<Vec<_>>();
@@ -353,6 +402,19 @@ fn candidate_only_direct_leaf_ids(
         }
     }
     Ok(ids)
+}
+
+fn child_metasystem_node_ids(genome: &OrganizationalGenome, root_node_id: &NodeId) -> Vec<NodeId> {
+    genome
+        .nodes
+        .values()
+        .filter(|node| {
+            &node.id != root_node_id
+                && node.is_metasystem()
+                && node.status != vsm_core::NodeLifecycleStatus::Retired
+        })
+        .map(|node| node.id.clone())
+        .collect()
 }
 
 #[derive(Debug, Error)]
@@ -439,6 +501,77 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == vsm_ledger::LedgerEventKind::TraceWritten));
+    }
+
+    #[tokio::test]
+    async fn local_system_runs_nested_metasystem_controller_path() {
+        let system = LocalVsmSystem::with_in_memory_sqlite_ledger(
+            LocalVsmSystem::nested_coder_genome(),
+            Arc::new(EchoModelProvider::default()),
+        )
+        .await
+        .expect("system");
+
+        let mut directive = Directive::new(
+            "user",
+            "Implement backend change",
+            "Route through a backend metasystem before reaching a coding leaf.",
+        );
+        directive
+            .metadata
+            .insert("requires_code_write".to_string(), "true".to_string());
+
+        let report = system
+            .run_directive(directive)
+            .await
+            .expect("nested directive run");
+
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.traces.len(), 1);
+
+        let genome = system.shared_genome().read().await.clone();
+        let root_id = genome.root_node_id.clone();
+        let backend_id = genome
+            .get_node(&root_id)
+            .expect("root")
+            .children
+            .first()
+            .expect("backend")
+            .clone();
+        let coder_id = genome
+            .get_node(&backend_id)
+            .expect("backend")
+            .children
+            .first()
+            .expect("coder")
+            .clone();
+
+        assert_eq!(report.traces[0].assigned_node_id, coder_id);
+        assert!(report.traces[0]
+            .responsible_ancestor_ids
+            .iter()
+            .any(|ancestor| ancestor == &backend_id));
+        assert!(report.traces[0]
+            .responsible_ancestor_ids
+            .iter()
+            .any(|ancestor| ancestor == &root_id));
+
+        let routed_parent_ids = report
+            .events
+            .iter()
+            .filter(|event| event.kind == vsm_ledger::LedgerEventKind::TaskRouted)
+            .filter_map(|event| event.payload["parent_node_id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(routed_parent_ids.contains(&root_id.as_str()));
+        assert!(routed_parent_ids.contains(&backend_id.as_str()));
+
+        let root_results = report
+            .events
+            .iter()
+            .filter(|event| event.kind == vsm_ledger::LedgerEventKind::TaskResultReceived)
+            .filter(|event| event.node_id.as_ref() == Some(&root_id))
+            .count();
+        assert_eq!(root_results, 1);
     }
 
     #[tokio::test]

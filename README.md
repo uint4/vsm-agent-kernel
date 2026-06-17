@@ -21,7 +21,7 @@ The workspace is split into seven crates:
 - **`vsm-worker`**: leaf worker harness. It subscribes to task packets, enforces leaf capabilities, calls a model provider, publishes task results, and records task traces.
 - **`vsm-ledger`**: storage-agnostic empirical ledger with in-memory and SQLite implementations.
 - **`vsm-controller`**: metasystem runtime for directive intake, routing/delegation, result observation, ledger events, and System 3* audit suggestions.
-- **`vsm-system`**: local end-to-end orchestrator that composes controller, workers, transport, ledger, evolution generation, queued trial activation, and directive execution.
+- **`vsm-system`**: local end-to-end orchestrator that composes recursive controllers, workers, transport, ledger, evolution generation, queued trial activation, and directive execution.
 
 ## Conceptual Model
 
@@ -164,6 +164,7 @@ The ledger stores:
 - genome patch events
 - genome snapshots
 - per-controller champion genome pointers
+- resource allocation decisions with ResourceBargaining epoch accounting evidence
 - queued, active, and archived trial records
 - deterministic evolution generation records
 
@@ -172,7 +173,7 @@ Implementations:
 - `InMemoryLedger`
 - `SqliteLedger`
 
-The default subtree trace query uses `assigned_node_id` plus `responsible_ancestor_ids`. Task mapping and routing events carry directive IDs, parent task IDs, dependency IDs, source channel metadata, and correlation/causation IDs so decomposition views can be derived from VSM channel traffic instead of stored as a separate authoritative graph. `vsm-core` also exposes minimum viable attributed fitness summaries: direct workers receive direct credit/blame, the immediate responsible parent receives subtree credit/blame, and higher ancestors receive decayed credit/blame. SQLite and in-memory ledgers also persist enough genome/trial state for controller restart recovery and queued candidate activation.
+The default subtree trace query uses `assigned_node_id` plus `responsible_ancestor_ids`. Task mapping and routing events carry directive IDs, parent task IDs, dependency IDs, source channel metadata, and correlation/causation IDs so decomposition views can be derived from VSM channel traffic instead of stored as a separate authoritative graph. Resource allocation decisions carry epoch keys plus token/message budget, used, approved, and remaining counts so System 3 can account for generic resources without assuming app-specific metrics. Recent System 2 contention, oscillation, and blocked-dependency evidence can also constrain ResourceBargaining token grants for the affected child. Algedonic override events can pause/resume target subtrees, block routing and resource grants while paused, escalate pain/pleasure signals toward the root, and still freeze unsafe mutation trials. `vsm-core` also exposes minimum viable attributed fitness summaries: direct workers receive direct credit/blame, the immediate responsible parent receives subtree credit/blame, and higher ancestors receive decayed credit/blame. SQLite and in-memory ledgers also persist enough genome/trial state for controller restart recovery and queued candidate activation.
 
 ## Controller
 
@@ -249,7 +250,7 @@ Trial promotion/pruning still uses direct trial scores to avoid double-counting 
 
 ## Local System Runner
 
-`vsm-system::LocalVsmSystem` is the reusable local orchestration surface. It boots a controller, in-memory transport, SQLite ledger, and worker harnesses, then runs directives through the same message path used by the lower-level runtimes. It can also run one deterministic System 3 evolution generation, activate the selected queued candidate, register candidate workers, and execute trial-routed work while preserving the one-active-trial invariant.
+`vsm-system::LocalVsmSystem` is the reusable local orchestration surface. It boots the root controller, child metasystem controllers, in-memory transport, SQLite ledger, and worker harnesses, then runs directives through the same message path used by the lower-level runtimes. Child metasystem controllers route work to their leaves and forward results back upward to the root. The runner can also run one deterministic System 3 evolution generation, activate the selected queued candidate, register candidate workers, and execute trial-routed work while preserving the one-active-trial invariant.
 
 Run the local evolution cycle:
 
