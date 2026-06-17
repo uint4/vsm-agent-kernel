@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use vsm_controller::EvolutionPolicy;
+use vsm_controller::RuleBasedSystem3StarAuditor;
 use vsm_core::Directive;
 use vsm_system::LocalVsmSystem;
 use vsm_worker::{ModelProvider, ModelProviderError, ModelRequest, ModelResponse, ModelUsage};
@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut failing = Directive::new(
         "user",
         "Exercise failing primary service",
-        "The primary coding leaf fails this first task so System 3 sees mutation pressure.",
+        "The primary coding leaf fails this first task so System 3* sees audit pressure.",
     );
     failing
         .metadata
@@ -33,30 +33,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .is_some_and(|trace| trace.merged == Some(false))
     );
 
-    let mut policy = EvolutionPolicy::default();
-    policy.min_pressure_traces = 1;
-    policy.failure_ratio_for_review = 0.1;
-    policy.max_offspring_per_generation = 1;
-    policy.population_size = 2;
-    let generation = system
-        .run_evolution_generation(policy)
-        .await?
-        .ok_or("evolution did not create a generation")?;
+    let auditor = RuleBasedSystem3StarAuditor {
+        min_traces_for_review_suggestion: 1,
+        failed_task_ratio_threshold: 0.1,
+    };
+    let audit_report = system.run_system_3_star_audit(&auditor).await?;
     println!(
-        "generation={} offspring={:?} operators={:?}",
-        generation.generation, generation.offspring_trial_ids, generation.mutation_operator_counts
+        "audit findings={} suggested_patches={}",
+        audit_report.findings.len(),
+        audit_report.suggested_patches.len()
     );
 
-    let trial_id = generation
-        .offspring_trial_ids
-        .first()
-        .cloned()
-        .ok_or("generation did not create offspring")?;
     let candidate_genome_id = system
         .start_next_trial_and_register_candidate_workers()
         .await?
         .ok_or("queued candidate did not start")?;
     println!("active candidate genome: {candidate_genome_id}");
+    let trial_id = system
+        .ledger()
+        .get_active_trial_record(&system.root_node_id())
+        .await?
+        .ok_or("active trial record missing")?
+        .trial_id;
 
     let mut review = Directive::new(
         "user",

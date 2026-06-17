@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_system_runs_failure_evolution_trial_and_promotion() {
+    async fn local_system_runs_audit_suggested_trial_and_promotion() {
         let system = LocalVsmSystem::with_in_memory_sqlite_ledger(
             LocalVsmSystem::single_coder_genome(),
             Arc::new(NodeSelectiveProvider),
@@ -598,29 +598,28 @@ mod tests {
         assert_eq!(failed_report.results.len(), 1);
         assert_eq!(failed_report.traces[0].merged, Some(false));
 
-        let mut policy = EvolutionPolicy::default();
-        policy.min_pressure_traces = 1;
-        policy.failure_ratio_for_review = 0.1;
-        policy.max_offspring_per_generation = 1;
-        policy.population_size = 2;
-        let generation = system
-            .run_evolution_generation(policy)
+        let auditor = RuleBasedSystem3StarAuditor {
+            min_traces_for_review_suggestion: 1,
+            failed_task_ratio_threshold: 0.1,
+        };
+        let report = system
+            .run_system_3_star_audit(&auditor)
             .await
-            .expect("evolution generation")
-            .expect("generation created");
-        assert_eq!(
-            generation
-                .mutation_operator_counts
-                .get("add_child_reviewer"),
-            Some(&1)
-        );
+            .expect("audit report");
+        assert_eq!(report.suggested_patches.len(), 1);
 
-        let trial_id = generation.offspring_trial_ids[0].clone();
         let candidate_genome_id = system
             .start_next_trial_and_register_candidate_workers()
             .await
             .expect("start trial")
             .expect("candidate genome");
+        let active = system
+            .ledger()
+            .get_active_trial_record(&system.root_node_id())
+            .await
+            .expect("active trial")
+            .expect("active trial exists");
+        let trial_id = active.trial_id.clone();
 
         let mut review = Directive::new(
             "user",
@@ -663,18 +662,11 @@ mod tests {
             .expect("trial record")
             .expect("trial exists");
         assert_eq!(record.status, vsm_ledger::StoredTrialStatus::Promoted);
-        assert_eq!(
-            record
-                .metadata
-                .get("evolution_operator")
-                .map(String::as_str),
-            Some("add_child_reviewer")
-        );
-
-        assert_eq!(
-            suggestion_operator(&record.suggestion),
-            "add_child_reviewer"
-        );
+        assert_eq!(suggestion_operator(&record.suggestion), "unknown");
+        assert!(matches!(
+            record.suggestion.source,
+            vsm_core::GeneSuggestionSource::System3StarAudit
+        ));
     }
 
     #[derive(Clone, Debug)]

@@ -5641,11 +5641,11 @@ mod tests {
 
         for _ in 0..5 {
             let mut trace = TaskTrace::started(TaskId::new(), genome_id.clone(), coder_id.clone());
-            trace.merged = Some(false);
-            trace.tests_passed = Some(false);
-            trace.outcome_score = -8.0;
-            trace.input_tokens = 10_000;
-            trace.output_tokens = 2_000;
+            trace.merged = Some(true);
+            trace.tests_passed = Some(true);
+            trace.outcome_score = 2.0;
+            trace.input_tokens = 150_000;
+            trace.output_tokens = 10_000;
             ledger.write_task_trace(trace).await.expect("trace");
         }
 
@@ -5662,7 +5662,7 @@ mod tests {
         assert_eq!(
             generation
                 .mutation_operator_counts
-                .get("add_child_reviewer"),
+                .get("add_prompt_parsimony_guardrail"),
             Some(&1)
         );
 
@@ -5683,7 +5683,7 @@ mod tests {
                 .metadata
                 .get("evolution_operator")
                 .map(String::as_str),
-            Some("add_child_reviewer")
+            Some("add_prompt_parsimony_guardrail")
         );
 
         let latest = ledger
