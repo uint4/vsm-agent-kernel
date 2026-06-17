@@ -62,6 +62,7 @@ pub enum StoredTrialStatus {
     Promoted,
     Pruned,
     Rejected,
+    Frozen,
     Archived,
 }
 
@@ -73,6 +74,7 @@ impl StoredTrialStatus {
             Self::Promoted => "promoted",
             Self::Pruned => "pruned",
             Self::Rejected => "rejected",
+            Self::Frozen => "frozen",
             Self::Archived => "archived",
         }
     }
@@ -177,6 +179,16 @@ impl StoredTrialRecord {
         self.metadata
             .insert("rejection_reason".to_string(), reason.into());
     }
+
+    pub fn mark_frozen(&mut self, reason: impl Into<String>) {
+        let now = Utc::now();
+        self.status = StoredTrialStatus::Frozen;
+        self.updated_at = now;
+        self.completed_at = Some(now);
+        self.decision = None;
+        self.metadata
+            .insert("freeze_reason".to_string(), reason.into());
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +272,46 @@ impl PopulationArchiveRecord {
             selection_score,
             pareto_frontier_size,
             objectives,
+            metadata: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EvolutionGenerationRecord {
+    pub controller_node_id: NodeId,
+    pub generation: u64,
+    pub champion_genome_id: GenomeId,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub policy: String,
+    pub parent_trial_ids: Vec<SuggestionId>,
+    pub offspring_trial_ids: Vec<SuggestionId>,
+    pub mutation_operator_counts: BTreeMap<String, u64>,
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl EvolutionGenerationRecord {
+    pub fn new(
+        controller_node_id: NodeId,
+        generation: u64,
+        champion_genome_id: GenomeId,
+        policy: impl Into<String>,
+        parent_trial_ids: Vec<SuggestionId>,
+        offspring_trial_ids: Vec<SuggestionId>,
+        mutation_operator_counts: BTreeMap<String, u64>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            controller_node_id,
+            generation,
+            champion_genome_id,
+            created_at: now,
+            updated_at: now,
+            policy: policy.into(),
+            parent_trial_ids,
+            offspring_trial_ids,
+            mutation_operator_counts,
             metadata: BTreeMap::new(),
         }
     }

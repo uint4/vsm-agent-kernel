@@ -1,6 +1,6 @@
 use crate::{
-    ChannelPriority, Directive, MessageId, NodeId, OrganizationalGenomePatch, SuggestionId, TaskId,
-    TaskPacket, TaskResult, VsmChannelType,
+    ChannelPriority, Directive, MessageId, NodeId, OrganizationalGenomePatch, RiskClass,
+    SuggestionId, TaskArtifact, TaskId, TaskPacket, TaskResult, VsmChannelType,
 };
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -121,6 +121,8 @@ impl AlgedonicSignal {
 pub struct ResourceBargain {
     pub requested_by: NodeId,
     pub task_id: Option<TaskId>,
+    #[serde(default)]
+    pub proposed_task: Option<TaskPacket>,
     pub requested_tokens: Option<u64>,
     pub requested_tool_permissions: Vec<String>,
     pub requested_context_refs: Vec<String>,
@@ -147,6 +149,157 @@ pub struct ResourceAllocationDecision {
     pub reasons: Vec<String>,
     pub allocation_policy: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum System2CoordinationKind {
+    DependencyBlocked,
+    DependencyReady,
+    Contention,
+    Oscillation,
+    HandoffNotice,
+    Other(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct System2CoordinationSignal {
+    pub coordinator_node_id: NodeId,
+    pub source_node_id: Option<NodeId>,
+    pub target_node_id: Option<NodeId>,
+    pub affected_node_ids: Vec<NodeId>,
+    pub affected_task_ids: Vec<TaskId>,
+    pub kind: System2CoordinationKind,
+    pub summary: String,
+    pub evidence: Vec<String>,
+    pub severity: Option<u8>,
+    pub metadata: BTreeMap<String, String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl System2CoordinationSignal {
+    pub fn new(
+        coordinator_node_id: NodeId,
+        kind: System2CoordinationKind,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            coordinator_node_id,
+            source_node_id: None,
+            target_node_id: None,
+            affected_node_ids: vec![],
+            affected_task_ids: vec![],
+            kind,
+            summary: summary.into(),
+            evidence: vec![],
+            severity: None,
+            metadata: BTreeMap::new(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperationHandoffKind {
+    WorkInProgress,
+    DependencyReady,
+    DependencyBlocked,
+    ArtifactTransfer,
+    ReviewRequest,
+    Other(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationHandoff {
+    pub source_node_id: NodeId,
+    pub target_node_id: NodeId,
+    pub related_task_id: Option<TaskId>,
+    pub dependency_task_ids: Vec<TaskId>,
+    pub kind: OperationHandoffKind,
+    pub title: String,
+    pub summary: String,
+    pub artifacts: Vec<TaskArtifact>,
+    pub evidence: Vec<String>,
+    pub metadata: BTreeMap<String, String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl OperationHandoff {
+    pub fn new(
+        source_node_id: NodeId,
+        target_node_id: NodeId,
+        kind: OperationHandoffKind,
+        title: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_node_id,
+            target_node_id,
+            related_task_id: None,
+            dependency_task_ids: vec![],
+            kind,
+            title: title.into(),
+            summary: summary.into(),
+            artifacts: vec![],
+            evidence: vec![],
+            metadata: BTreeMap::new(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ManagementOperationKind {
+    AssignWork,
+    Reprioritize,
+    IntegrateResult,
+    RequestStatus,
+    LocalPolicy,
+    Other(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagementOperationDirective {
+    pub manager_node_id: NodeId,
+    pub operation_node_id: NodeId,
+    pub related_task_id: Option<TaskId>,
+    pub dependency_task_ids: Vec<TaskId>,
+    pub kind: ManagementOperationKind,
+    pub title: String,
+    pub body: String,
+    pub target_state: Option<String>,
+    pub constraints: Vec<String>,
+    pub context_refs: Vec<String>,
+    pub authority_refs: Vec<String>,
+    pub risk: RiskClass,
+    pub metadata: BTreeMap<String, String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ManagementOperationDirective {
+    pub fn new(
+        manager_node_id: NodeId,
+        operation_node_id: NodeId,
+        kind: ManagementOperationKind,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            manager_node_id,
+            operation_node_id,
+            related_task_id: None,
+            dependency_task_ids: vec![],
+            kind,
+            title: title.into(),
+            body: body.into(),
+            target_state: None,
+            constraints: vec![],
+            context_refs: vec![],
+            authority_refs: vec![],
+            risk: RiskClass::Medium,
+            metadata: BTreeMap::new(),
+            created_at: Utc::now(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +354,73 @@ impl EnvironmentSignal {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThreeFourHomeostatKind {
+    PresentConstraint,
+    FutureRisk,
+    FutureOpportunity,
+    CapabilityGap,
+    ResourceImbalance,
+    CoordinationDebt,
+    Other(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThreeFourHomeostatBalance {
+    PresentDominant,
+    FutureDominant,
+    Balanced,
+    Conflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreeFourHomeostatSignal {
+    pub system_3_node_id: NodeId,
+    pub system_4_node_id: NodeId,
+    pub target_node_id: NodeId,
+    pub related_task_id: Option<TaskId>,
+    pub related_suggestion_id: Option<SuggestionId>,
+    pub kind: ThreeFourHomeostatKind,
+    pub balance: ThreeFourHomeostatBalance,
+    pub present_summary: String,
+    pub future_summary: String,
+    pub recommendation: String,
+    pub evidence: Vec<String>,
+    pub suggested_patches: Vec<OrganizationalGenomePatch>,
+    pub severity: Option<u8>,
+    pub metadata: BTreeMap<String, String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ThreeFourHomeostatSignal {
+    pub fn new(
+        system_3_node_id: NodeId,
+        system_4_node_id: NodeId,
+        target_node_id: NodeId,
+        kind: ThreeFourHomeostatKind,
+        balance: ThreeFourHomeostatBalance,
+        recommendation: impl Into<String>,
+    ) -> Self {
+        Self {
+            system_3_node_id,
+            system_4_node_id,
+            target_node_id,
+            related_task_id: None,
+            related_suggestion_id: None,
+            kind,
+            balance,
+            present_summary: String::new(),
+            future_summary: String::new(),
+            recommendation: recommendation.into(),
+            evidence: vec![],
+            suggested_patches: vec![],
+            severity: None,
+            metadata: BTreeMap::new(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Command {
     pub issued_by: NodeId,
     pub target: NodeId,
@@ -241,11 +461,15 @@ pub enum BuiltinPayloadType {
     TaskResult,
     ResourceBargain,
     ResourceAllocationDecision,
+    System2CoordinationSignal,
+    OperationHandoff,
+    ManagementOperationDirective,
     EnvironmentSignal,
     Command,
     AuditRequest,
     AuditReport,
     AlgedonicSignal,
+    ThreeFourHomeostatSignal,
     GeneSuggestion,
 }
 
@@ -257,11 +481,15 @@ impl BuiltinPayloadType {
             Self::TaskResult => "vsm.task_result",
             Self::ResourceBargain => "vsm.resource_bargain",
             Self::ResourceAllocationDecision => "vsm.resource_allocation_decision",
+            Self::System2CoordinationSignal => "vsm.system2_coordination_signal",
+            Self::OperationHandoff => "vsm.operation_handoff",
+            Self::ManagementOperationDirective => "vsm.management_operation_directive",
             Self::EnvironmentSignal => "vsm.environment_signal",
             Self::Command => "vsm.command",
             Self::AuditRequest => "vsm.audit_request",
             Self::AuditReport => "vsm.audit_report",
             Self::AlgedonicSignal => "vsm.algedonic_signal",
+            Self::ThreeFourHomeostatSignal => "vsm.three_four_homeostat_signal",
             Self::GeneSuggestion => "vsm.gene_suggestion",
         }
     }

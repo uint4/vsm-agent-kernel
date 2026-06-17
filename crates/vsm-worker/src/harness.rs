@@ -194,6 +194,8 @@ impl WorkerHarness {
         };
 
         copy_trial_metadata(&task, &mut result, &mut trace);
+        copy_decomposition_metadata(&task, &mut result, &mut trace);
+        copy_channel_metadata(&task, incoming, &mut result, &mut trace);
         copy_replay_metadata(&task, &mut trace);
 
         if let Some(usage) = usage {
@@ -300,6 +302,156 @@ fn copy_trial_metadata(task: &TaskPacket, result: &mut TaskResult, trace: &mut T
     }
 }
 
+fn copy_decomposition_metadata(task: &TaskPacket, result: &mut TaskResult, trace: &mut TaskTrace) {
+    result
+        .metadata
+        .insert("task_title".to_string(), task.title.clone());
+    result
+        .metadata
+        .insert("task_goal".to_string(), task.goal.clone());
+    trace
+        .metadata
+        .insert("task_title".to_string(), task.title.clone());
+    trace
+        .metadata
+        .insert("task_goal".to_string(), task.goal.clone());
+
+    if let Some(directive_id) = &task.directive_id {
+        let value = directive_id.to_string();
+        result
+            .metadata
+            .insert("directive_id".to_string(), value.clone());
+        trace.metadata.insert("directive_id".to_string(), value);
+    }
+    if let Some(parent_task_id) = &task.parent_task_id {
+        let value = parent_task_id.to_string();
+        result
+            .metadata
+            .insert("parent_task_id".to_string(), value.clone());
+        trace.metadata.insert("parent_task_id".to_string(), value);
+    }
+    if !task.dependencies.is_empty() {
+        let value = task
+            .dependencies
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        result
+            .metadata
+            .insert("dependency_task_ids".to_string(), value.clone());
+        trace
+            .metadata
+            .insert("dependency_task_ids".to_string(), value);
+    }
+
+    for key in [
+        "decomposition_policy",
+        "decomposition_authority",
+        "decomposition_role",
+        "decomposition_parent_task_id",
+        "decomposition_task_count",
+        "decomposition_revision_depth",
+        "decomposition_revision_of_task_id",
+        "required_capability",
+        "target_child",
+    ] {
+        if let Some(value) = task.metadata.get(key) {
+            result.metadata.insert(key.to_string(), value.clone());
+            trace.metadata.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+fn copy_channel_metadata(
+    task: &TaskPacket,
+    incoming: &MessageEnvelope,
+    result: &mut TaskResult,
+    trace: &mut TaskTrace,
+) {
+    insert_result_trace_metadata(
+        result,
+        trace,
+        "vsm_outbound_channel",
+        incoming
+            .metadata
+            .get("vsm_outbound_channel")
+            .cloned()
+            .unwrap_or_else(|| format!("{:?}", incoming.channel_type)),
+    );
+    insert_result_trace_metadata(
+        result,
+        trace,
+        "channel_priority",
+        format!("{:?}", incoming.priority),
+    );
+    insert_result_trace_metadata(result, trace, "envelope_id", incoming.id.to_string());
+    if let Some(correlation_id) = &incoming.correlation_id {
+        insert_result_trace_metadata(result, trace, "correlation_id", correlation_id.clone());
+    }
+    if let Some(causation_id) = &incoming.causation_id {
+        insert_result_trace_metadata(result, trace, "causation_id", causation_id.to_string());
+    }
+
+    for key in [
+        "vsm_source_channel",
+        "vsm_outbound_channel",
+        "handoff_kind",
+        "handoff_channel",
+        "handoff_source_node_id",
+        "handoff_target_node_id",
+        "handoff_via_controller_node_id",
+        "handoff_correlation_id",
+        "handoff_causation_id",
+        "handoff_envelope_id",
+        "handoff_operation_kind",
+        "handoff_artifact_count",
+        "handoff_related_task_id",
+        "handoff_dependency_task_ids",
+        "handoff_artifact_refs",
+        "handoff_summary",
+        "management_kind",
+        "management_channel",
+        "management_source_node_id",
+        "management_target_node_id",
+        "management_via_controller_node_id",
+        "management_correlation_id",
+        "management_causation_id",
+        "management_envelope_id",
+        "management_operation_kind",
+        "management_directive_message_id",
+        "management_policy",
+        "management_related_task_id",
+        "management_dependency_task_ids",
+        "coordination_policy",
+        "coordination_kind",
+        "coordination_signal_message_id",
+        "coordination_source_node_id",
+        "coordination_target_node_id",
+        "coordination_severity",
+        "coordination_affected_node_ids",
+        "coordination_affected_task_ids",
+    ] {
+        if let Some(value) = task
+            .metadata
+            .get(key)
+            .or_else(|| incoming.metadata.get(key))
+        {
+            insert_result_trace_metadata(result, trace, key, value.clone());
+        }
+    }
+}
+
+fn insert_result_trace_metadata(
+    result: &mut TaskResult,
+    trace: &mut TaskTrace,
+    key: &str,
+    value: String,
+) {
+    result.metadata.insert(key.to_string(), value.clone());
+    trace.metadata.insert(key.to_string(), value);
+}
+
 fn copy_replay_metadata(task: &TaskPacket, trace: &mut TaskTrace) {
     trace
         .metadata
@@ -397,10 +549,14 @@ fn require_capability(
 #[cfg(test)]
 mod tests {
     use vsm_core::{
-        GenomeId, NodeId, SuggestionId, TaskId, TaskPacket, TaskResult, TaskTrace, VsmChannelType,
+        BuiltinPayloadType, ChannelPriority, GenomeId, MessageEnvelope, NodeId, SuggestionId,
+        TaskId, TaskPacket, TaskResult, TaskTrace, VsmChannelType,
     };
 
-    use super::{copy_replay_metadata, copy_trial_metadata, WorkerHarnessConfig};
+    use super::{
+        copy_channel_metadata, copy_decomposition_metadata, copy_replay_metadata,
+        copy_trial_metadata, WorkerHarnessConfig,
+    };
 
     #[test]
     fn worker_default_subscribes_to_executable_vsm_channels() {
@@ -489,6 +645,167 @@ mod tests {
                 .get("trial_exposure_bucket")
                 .map(String::as_str),
             Some("42")
+        );
+    }
+
+    #[test]
+    fn decomposition_metadata_is_copied_to_result_and_trace() {
+        let directive_id = vsm_core::DirectiveId::new();
+        let parent_task_id = TaskId::new();
+        let dependency_id = TaskId::new();
+        let node_id = NodeId::new();
+        let mut task = TaskPacket::new("review task", "review decomposed work");
+        task.directive_id = Some(directive_id.clone());
+        task.parent_task_id = Some(parent_task_id.clone());
+        task.dependencies.push(dependency_id.clone());
+        task.metadata.insert(
+            "decomposition_policy".to_string(),
+            "system3_capability_split_v1".to_string(),
+        );
+        task.metadata
+            .insert("decomposition_role".to_string(), "review".to_string());
+        task.metadata
+            .insert("required_capability".to_string(), "review".to_string());
+        task.metadata
+            .insert("target_child".to_string(), "reviewer".to_string());
+        let mut result = TaskResult::completed(task.id.clone(), node_id.clone(), "ok");
+        let mut trace = TaskTrace::started(task.id.clone(), GenomeId::new(), node_id);
+
+        copy_decomposition_metadata(&task, &mut result, &mut trace);
+
+        assert_eq!(
+            result.metadata.get("directive_id").map(String::as_str),
+            Some(directive_id.as_str())
+        );
+        assert_eq!(
+            result.metadata.get("parent_task_id").map(String::as_str),
+            Some(parent_task_id.as_str())
+        );
+        assert_eq!(
+            result
+                .metadata
+                .get("dependency_task_ids")
+                .map(String::as_str),
+            Some(dependency_id.as_str())
+        );
+        assert_eq!(
+            result
+                .metadata
+                .get("decomposition_role")
+                .map(String::as_str),
+            Some("review")
+        );
+        assert_eq!(
+            trace.metadata.get("target_child").map(String::as_str),
+            Some("reviewer")
+        );
+    }
+
+    #[test]
+    fn channel_metadata_is_copied_to_result_and_trace() {
+        let node_id = NodeId::new();
+        let mut task = TaskPacket::new("handoff task", "continue peer work");
+        task.metadata.insert(
+            "vsm_source_channel".to_string(),
+            "OperationToOperation".to_string(),
+        );
+        task.metadata.insert(
+            "handoff_kind".to_string(),
+            "operation_to_operation".to_string(),
+        );
+        task.metadata.insert(
+            "handoff_source_node_id".to_string(),
+            "source-leaf".to_string(),
+        );
+        task.metadata.insert(
+            "handoff_operation_kind".to_string(),
+            "ReviewRequest".to_string(),
+        );
+        task.metadata
+            .insert("coordination_kind".to_string(), "Contention".to_string());
+        task.metadata.insert(
+            "coordination_policy".to_string(),
+            "system2_dampening_v1".to_string(),
+        );
+        task.metadata.insert(
+            "management_operation_kind".to_string(),
+            "AssignWork".to_string(),
+        );
+        task.metadata.insert(
+            "management_policy".to_string(),
+            "management_operation_directive_v1".to_string(),
+        );
+        let mut incoming = MessageEnvelope::new(
+            VsmChannelType::OperationToOperation,
+            BuiltinPayloadType::TaskPacket.as_str(),
+            &task,
+        )
+        .expect("incoming envelope");
+        incoming.priority = ChannelPriority::High;
+        incoming.correlation_id = Some("handoff-correlation".to_string());
+        incoming.metadata.insert(
+            "vsm_outbound_channel".to_string(),
+            "OperationToOperation".to_string(),
+        );
+        let mut result = TaskResult::completed(task.id.clone(), node_id.clone(), "ok");
+        let mut trace = TaskTrace::started(task.id.clone(), GenomeId::new(), node_id);
+
+        copy_channel_metadata(&task, &incoming, &mut result, &mut trace);
+
+        assert_eq!(
+            result
+                .metadata
+                .get("vsm_source_channel")
+                .map(String::as_str),
+            Some("OperationToOperation")
+        );
+        assert_eq!(
+            trace
+                .metadata
+                .get("vsm_outbound_channel")
+                .map(String::as_str),
+            Some("OperationToOperation")
+        );
+        assert_eq!(
+            trace.metadata.get("channel_priority").map(String::as_str),
+            Some("High")
+        );
+        assert_eq!(
+            trace.metadata.get("handoff_kind").map(String::as_str),
+            Some("operation_to_operation")
+        );
+        assert_eq!(
+            trace
+                .metadata
+                .get("handoff_operation_kind")
+                .map(String::as_str),
+            Some("ReviewRequest")
+        );
+        assert_eq!(
+            trace.metadata.get("correlation_id").map(String::as_str),
+            Some("handoff-correlation")
+        );
+        assert_eq!(
+            trace.metadata.get("coordination_kind").map(String::as_str),
+            Some("Contention")
+        );
+        assert_eq!(
+            result
+                .metadata
+                .get("coordination_policy")
+                .map(String::as_str),
+            Some("system2_dampening_v1")
+        );
+        assert_eq!(
+            trace
+                .metadata
+                .get("management_operation_kind")
+                .map(String::as_str),
+            Some("AssignWork")
+        );
+        assert_eq!(
+            result.metadata.get("management_policy").map(String::as_str),
+            Some("management_operation_directive_v1")
         );
     }
 

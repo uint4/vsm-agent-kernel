@@ -1,6 +1,6 @@
 use crate::{
-    EventFilter, GenomeSnapshot, Ledger, LedgerError, LedgerEvent, PopulationArchiveRecord,
-    StoredTrialRecord, TraceWindow,
+    EventFilter, EvolutionGenerationRecord, GenomeSnapshot, Ledger, LedgerError, LedgerEvent,
+    PopulationArchiveRecord, StoredTrialRecord, TraceWindow,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -16,6 +16,7 @@ pub struct InMemoryLedger {
     champion_genomes: Arc<Mutex<BTreeMap<NodeId, GenomeId>>>,
     trials: Arc<Mutex<BTreeMap<SuggestionId, StoredTrialRecord>>>,
     population_archive: Arc<Mutex<BTreeMap<SuggestionId, PopulationArchiveRecord>>>,
+    evolution_generations: Arc<Mutex<BTreeMap<(NodeId, u64), EvolutionGenerationRecord>>>,
 }
 
 impl InMemoryLedger {
@@ -196,6 +197,7 @@ impl Ledger for InMemoryLedger {
                         crate::StoredTrialStatus::Promoted
                             | crate::StoredTrialStatus::Pruned
                             | crate::StoredTrialStatus::Rejected
+                            | crate::StoredTrialStatus::Frozen
                             | crate::StoredTrialStatus::Archived
                     )
             })
@@ -262,6 +264,51 @@ impl Ledger for InMemoryLedger {
             .cloned()
             .collect();
         records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        if limit > 0 && records.len() > limit {
+            records.truncate(limit);
+        }
+        Ok(records)
+    }
+
+    async fn write_evolution_generation_record(
+        &self,
+        record: EvolutionGenerationRecord,
+    ) -> Result<(), LedgerError> {
+        self.evolution_generations.lock().await.insert(
+            (record.controller_node_id.clone(), record.generation),
+            record,
+        );
+        Ok(())
+    }
+
+    async fn latest_evolution_generation_record(
+        &self,
+        controller_node_id: &NodeId,
+    ) -> Result<Option<EvolutionGenerationRecord>, LedgerError> {
+        Ok(self
+            .evolution_generations
+            .lock()
+            .await
+            .values()
+            .filter(|record| &record.controller_node_id == controller_node_id)
+            .max_by(|left, right| left.generation.cmp(&right.generation))
+            .cloned())
+    }
+
+    async fn evolution_generation_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<EvolutionGenerationRecord>, LedgerError> {
+        let mut records: Vec<EvolutionGenerationRecord> = self
+            .evolution_generations
+            .lock()
+            .await
+            .values()
+            .filter(|record| &record.controller_node_id == controller_node_id)
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| b.generation.cmp(&a.generation));
         if limit > 0 && records.len() > limit {
             records.truncate(limit);
         }

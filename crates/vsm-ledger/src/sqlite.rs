@@ -1,6 +1,6 @@
 use crate::{
-    EventFilter, GenomeSnapshot, Ledger, LedgerError, LedgerEvent, PopulationArchiveRecord,
-    StoredTrialRecord, TraceWindow,
+    EventFilter, EvolutionGenerationRecord, GenomeSnapshot, Ledger, LedgerError, LedgerEvent,
+    PopulationArchiveRecord, StoredTrialRecord, TraceWindow,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -149,6 +149,22 @@ impl SqliteLedger {
                 ON population_archive_records(controller_node_id, status);
             CREATE INDEX IF NOT EXISTS idx_population_archive_candidate
                 ON population_archive_records(candidate_genome_id);
+
+            CREATE TABLE IF NOT EXISTS evolution_generation_records (
+                controller_node_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                champion_genome_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                policy TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                PRIMARY KEY (controller_node_id, generation)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_evolution_generation_controller
+                ON evolution_generation_records(controller_node_id, generation);
+            CREATE INDEX IF NOT EXISTS idx_evolution_generation_champion
+                ON evolution_generation_records(champion_genome_id);
             "#,
         )
         .map_err(LedgerError::from)?;
@@ -518,7 +534,7 @@ impl Ledger for SqliteLedger {
                 SELECT record_json
                 FROM trial_records
                 WHERE controller_node_id = ?1
-                  AND status IN ('promoted', 'pruned', 'rejected', 'archived')
+                  AND status IN ('promoted', 'pruned', 'rejected', 'frozen', 'archived')
                 ORDER BY updated_at DESC
                 LIMIT ?2
                 "#,
@@ -635,6 +651,89 @@ impl Ledger for SqliteLedger {
                 WHERE controller_node_id = ?1
                   AND status IN ('pareto_frontier', 'selected_for_trial', 'promoted')
                 ORDER BY updated_at DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(LedgerError::from)?;
+        let rows = stmt
+            .query_map(params![controller_node_id.to_string(), limit], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(LedgerError::from)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let json = row.map_err(LedgerError::from)?;
+            records.push(serde_json::from_str(&json)?);
+        }
+        Ok(records)
+    }
+
+    async fn write_evolution_generation_record(
+        &self,
+        record: EvolutionGenerationRecord,
+    ) -> Result<(), LedgerError> {
+        let record_json = serde_json::to_string(&record)?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO evolution_generation_records (
+                controller_node_id, generation, champion_genome_id, created_at,
+                updated_at, policy, record_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                record.controller_node_id.to_string(),
+                record.generation as i64,
+                record.champion_genome_id.to_string(),
+                record.created_at.to_rfc3339(),
+                record.updated_at.to_rfc3339(),
+                record.policy,
+                record_json,
+            ],
+        )
+        .map_err(LedgerError::from)?;
+        Ok(())
+    }
+
+    async fn latest_evolution_generation_record(
+        &self,
+        controller_node_id: &NodeId,
+    ) -> Result<Option<EvolutionGenerationRecord>, LedgerError> {
+        let conn = self.conn.lock().await;
+        let payload: Option<String> = conn
+            .query_row(
+                r#"
+                SELECT record_json
+                FROM evolution_generation_records
+                WHERE controller_node_id = ?1
+                ORDER BY generation DESC
+                LIMIT 1
+                "#,
+                params![controller_node_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(LedgerError::from)?;
+        payload
+            .map(|json| serde_json::from_str(&json).map_err(LedgerError::from))
+            .transpose()
+    }
+
+    async fn evolution_generation_records(
+        &self,
+        controller_node_id: &NodeId,
+        limit: usize,
+    ) -> Result<Vec<EvolutionGenerationRecord>, LedgerError> {
+        let limit = limit.max(1) as i64;
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT record_json
+                FROM evolution_generation_records
+                WHERE controller_node_id = ?1
+                ORDER BY generation DESC
                 LIMIT ?2
                 "#,
             )

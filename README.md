@@ -13,7 +13,7 @@ node has no children -> System 1 leaf -> may execute only according to leaf capa
 
 ## Workspace
 
-The workspace is split into six crates:
+The workspace is split into seven crates:
 
 - **`vsm-core`**: pure domain model. Nodes, capabilities, channels, messages, task packets, genome patches, gene suggestions, traces, fitness scaffolding, and the transport trait.
 - **`vsm-runtime`**: in-memory transport and early mutation-trial utilities for local simulation.
@@ -21,6 +21,7 @@ The workspace is split into six crates:
 - **`vsm-worker`**: leaf worker harness. It subscribes to task packets, enforces leaf capabilities, calls a model provider, publishes task results, and records task traces.
 - **`vsm-ledger`**: storage-agnostic empirical ledger with in-memory and SQLite implementations.
 - **`vsm-controller`**: metasystem runtime for directive intake, routing/delegation, result observation, ledger events, and System 3* audit suggestions.
+- **`vsm-system`**: local end-to-end orchestrator that composes controller, workers, transport, ledger, evolution generation, queued trial activation, and directive execution.
 
 ## Conceptual Model
 
@@ -164,6 +165,7 @@ The ledger stores:
 - genome snapshots
 - per-controller champion genome pointers
 - queued, active, and archived trial records
+- deterministic evolution generation records
 
 Implementations:
 
@@ -245,6 +247,28 @@ Trial routing now respects `trial_mode` and bounded exposure. `Probation` requir
 
 Trial promotion/pruning still uses direct trial scores to avoid double-counting parent and child credit in one decision total. `MutationTrial::attributed_fitness` exposes per-node attributed summaries for audits, future subtree pruning, and later population-level selection.
 
+## Local System Runner
+
+`vsm-system::LocalVsmSystem` is the reusable local orchestration surface. It boots a controller, in-memory transport, SQLite ledger, and worker harnesses, then runs directives through the same message path used by the lower-level runtimes. It can also run one deterministic System 3 evolution generation, activate the selected queued candidate, register candidate workers, and execute trial-routed work while preserving the one-active-trial invariant.
+
+Run the local evolution cycle:
+
+```bash
+cargo run -p vsm-system --example local_evolution_cycle
+```
+
+That example exercises a complete deterministic local cycle:
+
+```text
+champion directive
+  -> failed worker trace
+  -> System 3 evolution generation
+  -> queued reviewer candidate
+  -> active canary trial
+  -> candidate worker result
+  -> trial promotion
+```
+
 ## Current Status
 
 | # | Item | Status |
@@ -256,9 +280,9 @@ Trial promotion/pruning still uses direct trial scores to avoid double-counting 
 | 5 | Simple fitness scoring | Implemented, basic direct and attributed summaries |
 | 6 | System 3* audit suggestions | Implemented, scaffold/rule-based version |
 | 7 | Bounded mutation experiments | Implemented for queued candidates with replay-aware Pareto-front scored activation, durable population/Pareto archive records, one active controller-managed trial, deterministic canary/probation exposure, and shadow duplicate routing |
-| 8 | Promotion/pruning loop | Implemented for one active trial; full GA population loop is future work |
+| 8 | Promotion/pruning loop | Implemented for one active trial; deterministic GA generation feeds queued candidates without overlapping live trials |
 
-The next milestone is richer offline replay/evaluation coverage and model-directed System 3 decomposition through VSM channels. Do not jump to a broad overlapping GA population until attribution and rollback remain reliable under queued candidates.
+The next milestone is richer offline replay/evaluation coverage and model-directed System 3 decomposition through VSM channels. Do not enable overlapping live mutation trials until attribution and rollback remain reliable under queued candidates.
 
 ## Validation
 
@@ -272,6 +296,12 @@ Run all compile-level tests:
 
 ```bash
 cargo test --workspace
+```
+
+Run the local end-to-end system cycle:
+
+```bash
+cargo run -p vsm-system --example local_evolution_cycle
 ```
 
 Run the core genome smoke example:

@@ -22,6 +22,8 @@ pub use state::*;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use vsm_core::{
         GeneSuggestion, GeneSuggestionSource, LeafOperationSpec, OrganizationalGenome,
         OrganizationalGenomePatch, ViableNode,
@@ -155,6 +157,28 @@ mod tests {
         assert_eq!(completed_records[0].trial_id, completed.trial_id);
         assert_eq!(completed_records[0].status, StoredTrialStatus::Promoted);
 
+        let mut frozen = queued_trial_record(controller.clone(), &genome);
+        let frozen_id = frozen.trial_id.clone();
+        frozen.mark_active();
+        frozen.mark_frozen("algedonic freeze_mutation");
+        ledger
+            .write_trial_record(frozen.clone())
+            .await
+            .expect("frozen trial");
+
+        let completed_records = ledger
+            .completed_trial_records(&controller, 10)
+            .await
+            .expect("completed with frozen trials");
+        assert!(completed_records
+            .iter()
+            .any(|record| record.trial_id == frozen_id
+                && record.status == StoredTrialStatus::Frozen
+                && record
+                    .metadata
+                    .get("freeze_reason")
+                    .is_some_and(|reason| reason == "algedonic freeze_mutation")));
+
         let mut dominated_archive = PopulationArchiveRecord::new(
             controller.clone(),
             &completed,
@@ -224,6 +248,37 @@ mod tests {
             .expect("pareto archive");
         assert_eq!(pareto.len(), 1);
         assert_eq!(pareto[0].trial_id, selected_archive.trial_id);
+
+        let mut operator_counts = BTreeMap::new();
+        operator_counts.insert("add_child_reviewer".to_string(), 1);
+        let generation = EvolutionGenerationRecord::new(
+            controller.clone(),
+            1,
+            genome.id.clone(),
+            "deterministic_test_policy",
+            vec![completed.trial_id.clone()],
+            vec![queued_id.clone()],
+            operator_counts,
+        );
+        ledger
+            .write_evolution_generation_record(generation.clone())
+            .await
+            .expect("evolution generation");
+
+        let latest = ledger
+            .latest_evolution_generation_record(&controller)
+            .await
+            .expect("latest generation")
+            .expect("generation exists");
+        assert_eq!(latest.generation, 1);
+        assert_eq!(latest.offspring_trial_ids, vec![queued_id.clone()]);
+
+        let generations = ledger
+            .evolution_generation_records(&controller, 10)
+            .await
+            .expect("generation history");
+        assert_eq!(generations.len(), 1);
+        assert_eq!(generations[0].parent_trial_ids, generation.parent_trial_ids);
     }
 
     #[tokio::test]

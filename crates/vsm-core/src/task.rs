@@ -25,6 +25,7 @@ pub struct StaticTaskPredicates {
     pub security_sensitive: bool,
     pub estimated_blast_radius: Option<RiskClass>,
     pub tags: Vec<String>,
+    pub domain_markers: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

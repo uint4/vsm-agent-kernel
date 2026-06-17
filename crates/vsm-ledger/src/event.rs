@@ -29,6 +29,8 @@ pub enum LedgerEventKind {
     TrialPromoted,
     TrialPruned,
     TrialRejected,
+    TrialFrozen,
+    EvolutionGenerationCreated,
     Other(String),
 }
 
@@ -57,6 +59,8 @@ impl LedgerEventKind {
             Self::TrialPromoted => "trial_promoted".to_string(),
             Self::TrialPruned => "trial_pruned".to_string(),
             Self::TrialRejected => "trial_rejected".to_string(),
+            Self::TrialFrozen => "trial_frozen".to_string(),
+            Self::EvolutionGenerationCreated => "evolution_generation_created".to_string(),
             Self::Other(value) => format!("other:{value}"),
         }
     }

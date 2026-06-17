@@ -112,6 +112,7 @@ pub fn score_trace(trace: &TaskTrace, weights: &FitnessWeights) -> f64 {
     score -= trace.latency_ms as f64 * weights.latency_ms_weight;
     score -= (trace.lines_added.unsigned_abs() + trace.lines_deleted.unsigned_abs()) as f64
         * weights.line_delta_weight;
+    score -= trace_coordination_units(trace) * weights.coordination_message_weight;
 
     score
 }
@@ -251,6 +252,82 @@ fn empty_attributed_summary(node_id: NodeId) -> AttributedFitnessSummary {
     }
 }
 
+fn trace_coordination_units(trace: &TaskTrace) -> f64 {
+    let mut units = metadata_number(trace, "coordination_message_count").unwrap_or(0.0);
+
+    if let Some(channel) = metadata_value(trace, "vsm_source_channel")
+        .or_else(|| metadata_value(trace, "source_channel"))
+    {
+        units += channel_coordination_units(channel);
+    }
+
+    if let Some(outbound_channel) = metadata_value(trace, "vsm_outbound_channel") {
+        units += channel_coordination_units(outbound_channel) * 0.5;
+    }
+
+    units += count_metadata_list(trace, "dependency_task_ids") as f64;
+
+    if metadata_value(trace, "handoff_kind").is_some() {
+        units += 1.0;
+    }
+    if metadata_value(trace, "management_kind").is_some() {
+        units += 1.0;
+    }
+    if metadata_value(trace, "decomposition_revision_depth")
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(|depth| depth > 0)
+    {
+        units += 1.0;
+    }
+    if metadata_value(trace, "decomposition_role").is_some_and(|role| role != "implementation") {
+        units += 0.5;
+    }
+    if metadata_value(trace, "trial_shadow").is_some_and(is_truthy) {
+        units += 1.0;
+    }
+
+    units.max(0.0)
+}
+
+fn channel_coordination_units(channel: &str) -> f64 {
+    match channel {
+        "ResourceBargaining" | "OperationToEnvironment" => 0.0,
+        "Command" | "ManagementToOperation" => 1.0,
+        "System2Coordination" | "OperationToOperation" | "Audit" => 1.5,
+        "ThreeFourHomeostat" => 1.0,
+        "FutureProbeToEnvironment" | "EnvironmentToEnvironment" => 0.5,
+        "Algedonic" => 2.0,
+        _ => 0.0,
+    }
+}
+
+fn metadata_value<'a>(trace: &'a TaskTrace, key: &str) -> Option<&'a str> {
+    trace
+        .metadata
+        .get(key)
+        .or_else(|| trace.metadata.get(&format!("task_metadata.{key}")))
+        .map(String::as_str)
+}
+
+fn metadata_number(trace: &TaskTrace, key: &str) -> Option<f64> {
+    metadata_value(trace, key).and_then(|value| value.parse::<f64>().ok())
+}
+
+fn count_metadata_list(trace: &TaskTrace, key: &str) -> usize {
+    metadata_value(trace, key)
+        .map(|value| {
+            value
+                .split([',', '|'])
+                .filter(|part| !part.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn is_truthy(value: &str) -> bool {
+    value == "true" || value == "1" || value.eq_ignore_ascii_case("yes")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +450,37 @@ mod tests {
         assert_close(summary.raw_score, 10.0);
         assert_close(summary.complexity_penalty, 1.0);
         assert_close(summary.final_score, 9.0);
+    }
+
+    #[test]
+    fn score_trace_penalizes_coordination_evidence_from_channel_metadata() {
+        let leaf = NodeId::from("leaf");
+        let mut trace = trace_with_score(leaf, vec![], 10.0);
+        trace.metadata.insert(
+            "task_metadata.vsm_source_channel".to_string(),
+            "System2Coordination".to_string(),
+        );
+        trace.metadata.insert(
+            "vsm_outbound_channel".to_string(),
+            "System2Coordination".to_string(),
+        );
+        trace.metadata.insert(
+            "task_metadata.dependency_task_ids".to_string(),
+            "task-a,task-b".to_string(),
+        );
+        trace.metadata.insert(
+            "task_metadata.handoff_kind".to_string(),
+            "operation_to_operation".to_string(),
+        );
+        trace
+            .metadata
+            .insert("decomposition_role".to_string(), "review".to_string());
+        trace
+            .metadata
+            .insert("trial_shadow".to_string(), "true".to_string());
+        let mut weights = FitnessWeights::default();
+        weights.coordination_message_weight = 1.0;
+
+        assert_close(score_trace(&trace, &weights), 3.25);
     }
 }

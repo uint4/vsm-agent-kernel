@@ -493,6 +493,25 @@ impl TrialManager {
         Ok(completed)
     }
 
+    pub fn freeze_active(
+        &mut self,
+        controller_node_id: NodeId,
+        reason: impl Into<String>,
+    ) -> Result<CompletedTrial, ControllerError> {
+        let Some(trial) = self.active.take() else {
+            return Err(ControllerError::NoActiveTrial);
+        };
+        let reason = reason.into();
+        self.active_metadata
+            .insert("freeze_reason".to_string(), reason);
+        let evaluation = trial.evaluate(&self.config, &self.weights);
+        let record =
+            self.record_for_trial(&trial, controller_node_id, StoredTrialStatus::Frozen, None);
+        let completed = completed_trial(&trial, evaluation, record);
+        self.archive(trial);
+        Ok(completed)
+    }
+
     fn archive(&mut self, trial: MutationTrial) {
         let suggestion_id = trial.suggestion.id.to_string();
         self.archived.insert(suggestion_id, trial);
